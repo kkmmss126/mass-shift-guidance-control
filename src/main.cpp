@@ -4,213 +4,266 @@
 #include <chrono>     // 시간 제어(ms) 사용
 #include <string>     // string 자료형 사용
 
+/*
+ * 실제 하드웨어 측정을 통해 확보한
+ * 캘리브레이션 값을 불러온다.
+ *
+ * 현재 저장된 값
+ * ------------------------------------------------------------
+ * Servo Bottom Init PWM : 300
+ * Servo Top Init PWM    : 321
+ * SM1504 Center         : 1690 step
+ *
+ * MPU6050 Gyro Bias
+ * X :  76.09
+ * Y : -94.12
+ * Z : -19.14
+ */
+#include "calibration_data.h"
 
-// 시스템의 현재 단계를 정의하는 상태 열거형
-// 상태 머신(State Machine) 구조를 이용
-// Phase별 동작 흐름 관리
-enum class SystemState {
 
-    INITIALIZING,       // Phase 1: 센서 영점 및 초기화
-                        // IMU/Gyro 등 센서 기준값 설정 단계
+// ============================================================
+// 시스템 상태 정의
+// ============================================================
+//
+// 상태 머신(State Machine)을 이용하여
+// 전체 유도 과정을 Phase별로 관리한다.
+//
+enum class SystemState
+{
+    INITIALIZING,       // Phase 1 : 센서 및 구동기 초기화
 
-    MIDCOURSE_GUIDE,    // Phase 2: 중간 유도
-                        // 외부 명령을 받아 목표 방향으로 동체 기동
+    MIDCOURSE_GUIDE,    // Phase 2 : 중간 유도
 
-    TERMINAL_LOCKON,    // Phase 3: 종말 유도
-                        // 시커 기반 목표 추적 및 Lock-On 수행
+    TERMINAL_LOCKON,    // Phase 3 : 시커 기반 종말 유도
 
-    BODY_TRACKING,      // Phase 4: 최종 동체 고정 추종
-                        // 시커 방향과 동체 방향 정렬
+    BODY_TRACKING,      // Phase 4 : 동체-시커 정렬
 
-    MISSION_COMPLETE    // 모든 제어 과정 완료
+    MISSION_COMPLETE    // 전체 유도 과정 완료
 };
 
 
-// 제어 시스템 전역 상수 정의
-// 제어 주기, 기준각, 오차 허용 범위 등
-// 전체 제어 알고리즘에서 공통으로 사용하는 값
-struct ControlConstants {
-
-    // 제어 루프 주기
-    // 20ms = 50Hz 제어 시스템
+// ============================================================
+// 전체 제어 시스템에서 사용하는 공통 상수
+// ============================================================
+struct ControlConstants
+{
+    /*
+     * 제어 루프 주기
+     *
+     * 20 ms = 50 Hz
+     */
     static constexpr double LOOP_TIME_MS = 20.0;
 
-    // 자이로 오프셋 허용치
-    // 초기 센서 Calibration 과정에서 사용
-    static constexpr double GYRO_BIAS_TOLERANCE = 0.01;
 
-
-    // Phase 2 동체 제한 속도
-    // 한 제어 루프에서 이동 가능한 최대 각도(deg)
-    // 급격한 자세 변화를 방지하기 위한 제한값
+    /*
+     * Phase 2 동체 제한 이동량
+     *
+     * 현재 시뮬레이션에서는
+     * 한 제어 루프당 최대 2도를 이동하도록 제한한다.
+     */
     static constexpr double MAX_ANGULAR_VELOCITY = 2.0;
 
 
-    // 시커 짐벌 Yaw 기준 중심 위치
-    // Servo 중앙 위치(90도)
-    static constexpr double SEEKER_YAW_CENTER   = 90.0;
+    /*
+     * 시커 좌표계 기준 중심각
+     *
+     * 현재 제어 알고리즘 내부에서는
+     * 상대 각도를 계산하기 위한 논리적인 중심값으로 사용한다.
+     *
+     * 실제 서보모터의 물리적 초기 위치는
+     * calibration_data.h에 저장된 PWM 값을 사용한다.
+     */
+    static constexpr double SEEKER_YAW_CENTER = 90.0;
 
-
-    // 시커 짐벌 Pitch 기준 중심 위치
     static constexpr double SEEKER_PITCH_CENTER = 90.0;
 
 
-    // 동체 방향 기준 중심 위치
-    static constexpr double BODY_YAW_CENTER     = 90.0;
-
-
-    // Phase 3 Lock-On 판단 기준 오차
-    // 해당 값 이하로 목표 추적 시 성공 판단
+    /*
+     * Phase 3 Lock-On 허용 오차
+     */
     static constexpr double LOCKON_THRESHOLD = 2.0;
 
 
-    // Phase 4 최종 정렬 허용 오차
-    // 시커와 동체 방향 차이가 이 값 이하이면 완료
+    /*
+     * Phase 4 동체-시커 최종 정렬 허용 오차
+     */
     static constexpr double TRACKING_TOLERANCE = 0.5;
-
 };
-class IntegratedMissileController {
 
+
+// ============================================================
+// 종합 유도 제어 클래스
+// ============================================================
+class IntegratedMissileController
+{
 private:
 
-    // 현재 시스템 상태 저장 변수
-    // 초기 상태는 센서 초기화(INITIALIZING)
-    // 각 Phase 완료 후 다음 상태로 변경
+    /*
+     * 현재 시스템 상태
+     *
+     * 시스템 시작 시 반드시 INITIALIZING 상태에서 시작한다.
+     */
     SystemState m_currentState = SystemState::INITIALIZING;
 
 
-    // --- 공유 시스템 제어 변수 ---
+    // ========================================================
+    // 동체 상태 변수
+    // ========================================================
 
-
-    // 현재 동체 절대 각도 X축
-    // 실제 구현에서는 IMU 자세값 또는 엔코더 값을 사용
+    /*
+     * 현재 동체 절대 각도
+     *
+     * 실제 하드웨어 연결 이후에는
+     * IMU의 자세 추정값을 이용하도록 변경한다.
+     */
     double m_currentBodyX = 0.0;
-
-
-    // 현재 동체 절대 각도 Y축
     double m_currentBodyY = 0.0;
 
 
-    // 시커 상대 Yaw 각도
-    // 동체 기준으로 시커가 얼마나 회전했는지 나타냄
+    // ========================================================
+    // 시커 상태 변수
+    // ========================================================
+
+    /*
+     * 동체 기준 시커 상대 Yaw / Pitch 각도
+     */
     double m_seekerYawAngle = 0.0;
-
-
-    // 시커 상대 Pitch 각도
     double m_seekerPitchAngle = 0.0;
 
 
-    // 시커 절대 Yaw 각도
-    // Phase 4에서 동체 좌표계와 비교하기 위해 사용
+    /*
+     * Phase 4에서 사용하는 시커 절대 방향
+     */
     double m_seekerAbsYaw = 0.0;
-
-
-    // 시커 절대 Pitch 각도
     double m_seekerAbsPitch = 0.0;
 
 
-    // 안정적인 Lock-On 판정을 위한 카운터
-    // 순간적으로 오차가 작아지는 경우를 방지하기 위해
-    // 일정 횟수 이상 조건 만족 시 Lock-On 인정
+    /*
+     * 순간적인 오차 감소를 Lock-On으로 잘못 판단하지 않도록
+     * 일정 횟수 연속으로 조건을 만족했는지 확인한다.
+     */
     int m_stableLockCount = 0;
 
-    // ===============================
-    // 가상 센서 모킹 데이터
-    // 현재는 하드웨어 센서 대신 테스트용 값 사용
+
+    // ========================================================
+    // Mock Data
+    // ========================================================
     //
-    // 실제 적용 시:
-    // m_mockTargetX/Y → 시커 센서 입력값
-    // m_gyroYawRate/PitchRate → IMU Gyro 입력값으로 변경
-    // ===============================
+    // 아래 값들은 아직 실제 센서/통신 라이브러리가
+    // 메인 시스템에 연결되지 않았기 때문에 임시로 사용한다.
+    //
+    // 추후 외부 라이브러리 연결 시 실제 측정값으로 변경한다.
+    //
+    // 중요:
+    // calibration_data.h에 저장된 값은 Mock 값이 아니다.
+    // 실제 측정을 통해 확보한 하드웨어 기준값이다.
+    // ========================================================
 
-    // 가상 타겟 X 위치
-    // 시커 기준 상대값
+
+    /*
+     * 현재 시커 추적 알고리즘 검증용 목표 위치
+     *
+     * 추후 초음파 센서 거리값을 이용한
+     * 타겟 방향 계산으로 변경한다.
+     */
     double m_mockTargetX = 15.0;
-
-
-    // 가상 타겟 Y 위치
     double m_mockTargetY = 10.0;
 
 
-    // 가상 Gyro Yaw 각속도
-    // 외풍 및 회전 외란을 모사
+    /*
+     * 실시간 MPU6050 입력 연결 전
+     * 자세 외란을 모사하기 위한 각속도 값
+     *
+     * 추후:
+     *
+     * 실제 Gyro Raw
+     *      ↓
+     * calibration_data.h Bias 제거
+     *      ↓
+     * 보정된 Gyro Rate
+     *
+     * 구조로 변경한다.
+     */
     double m_gyroYawRate = -5.0;
-
-
-    // 가상 Gyro Pitch 각속도
     double m_gyroPitchRate = 3.0;
 
 
 public:
 
-    // ==================================================
+    // ========================================================
     // Servo PWM 출력 인터페이스
+    // ========================================================
     //
-    // 현재는 하드웨어 연결 전 함수 형태만 정의
+    // 아직 PCA9685 외부 라이브러리를 메인 코드에
+    // 연결하지 않았기 때문에 인터페이스 형태만 유지한다.
     //
-    // 실제 구현 시:
-    // - PCA9685 I2C PWM 모듈
-    // - MCU PWM 출력
-    // 등을 통해 Servo 제어
-    // ==================================================
+    // 추후 이 함수 내부만 실제 라이브러리 호출로 변경하면
+    // 메인 제어 알고리즘을 수정할 필요가 없다.
+    // ========================================================
 
-    void writeServoPWM(std::string motorName, double angle) {
+    void writeServoPWM(
+        const std::string& motorName,
+        int pwmValue)
+    {
+        /*
+         * 추후 실제 구현 예시
+         *
+         * PCA9685 외부 라이브러리
+         *      ↓
+         * 해당 채널에 pwmValue 출력
+         */
 
-        // 하드웨어 드라이버 인터페이스 (추후 구현부)
-
+        std::cout
+            << " -> [Servo Init] "
+            << motorName
+            << " PWM = "
+            << pwmValue
+            << '\n';
     }
 
-    // ==================================================
-    // Linear Actuator 제어 인터페이스
-    // 현재는 함수 형태만 정의
+
+    // ========================================================
+    // SM1504 Linear Actuator 출력 인터페이스
+    // ========================================================
     //
-    // 실제 구현 시:
-    // - A4988 STEP/DIR 신호 출력
-    // - 스텝모터 위치 제어
-    // 연결 예정
-    // ==================================================
+    // 현재는 실제 StepperMotor 라이브러리를 연결하지 않고
+    // 목표 step 위치를 전달할 수 있는 구조만 만들어 둔다.
+    // ========================================================
 
-    void writeLinearActuator(double position) {
+    void writeLinearActuator(int targetStep)
+    {
+        /*
+         * 추후 실제 구현:
+         *
+         * 기준점 Homing
+         *      ↓
+         * targetStep만큼 이동
+         */
 
-        // 하드웨어 드라이버 인터페이스 (추후 구현부)
-
+        std::cout
+            << " -> [SM1504 Init] Center Position = "
+            << targetStep
+            << " step\n";
     }
-        // ==================================================
-    // 메인 상태 머신 실행 루프
-    // 현재 시스템 상태를 확인하고
-    // 해당 Phase 함수를 호출하는 메인 제어 루프
-    //
-    // 전체 흐름:
-    //
-    // INITIALIZING
-    //       ↓
-    // MIDCOURSE_GUIDE
-    //       ↓
-    // TERMINAL_LOCKON
-    //       ↓
-    // BODY_TRACKING
-    //       ↓
-    // MISSION_COMPLETE
-    //
-    // 실제 임베디드에서는 Timer Interrupt 또는 RTOS Task로 구현
-    // ==================================================
-
-    void runSystem() {
-
-        std::cout << "==================================================" << std::endl;
-        std::cout << "   [종합 제어 시스템 구동] 메인 가상 테스트베드 가동" << std::endl;
-        std::cout << "==================================================" << std::endl;
 
 
-        // Mission Complete 상태가 될 때까지 반복 실행
-        while (m_currentState != SystemState::MISSION_COMPLETE) {
+    // ========================================================
+    // 전체 상태 머신 실행
+    // ========================================================
+
+    void runSystem()
+    {
+        std::cout
+            << "==================================================\n"
+            << "      Mass Shift Guidance Control System\n"
+            << "==================================================\n";
 
 
-            // 현재 상태에 맞는 Phase 실행
-            switch (m_currentState) {
-
-
-                // Phase 1: 센서 초기화
+        while (m_currentState != SystemState::MISSION_COMPLETE)
+        {
+            switch (m_currentState)
+            {
                 case SystemState::INITIALIZING:
 
                     processPhase1_Initializing();
@@ -218,7 +271,6 @@ public:
                     break;
 
 
-                // Phase 2: 중간 유도
                 case SystemState::MIDCOURSE_GUIDE:
 
                     processPhase2_MidcourseGuide();
@@ -226,7 +278,6 @@ public:
                     break;
 
 
-                // Phase 3: 종말 추적
                 case SystemState::TERMINAL_LOCKON:
 
                     processPhase3_TerminalLockOn();
@@ -234,7 +285,6 @@ public:
                     break;
 
 
-                // Phase 4: 동체 추종
                 case SystemState::BODY_TRACKING:
 
                     processPhase4_BodyTracking();
@@ -242,563 +292,558 @@ public:
                     break;
 
 
-                // 예외 상태 처리
                 default:
 
-                    m_currentState = SystemState::MISSION_COMPLETE;
+                    m_currentState =
+                        SystemState::MISSION_COMPLETE;
 
                     break;
             }
 
-            // ==================================================
-            // 제어 루프 주기 동기화
-            // 20ms 대기
-            // → 50Hz 제어 주기 유지
-            // 추후 delay보다 Timer 기반으로 최적화 예정
-            // ==================================================
 
+            /*
+             * 전체 상태 머신 기본 실행 주기
+             */
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(
-                    static_cast<long long>(ControlConstants::LOOP_TIME_MS)
+                    static_cast<long long>(
+                        ControlConstants::LOOP_TIME_MS
+                    )
                 )
             );
-
         }
 
-        std::cout << "\n==================================================" << std::endl;
-        std::cout << " 🎉 전체 시뮬레이션 성공적 종료: 모든 페이즈 완벽 통과" << std::endl;
-        std::cout << "==================================================" << std::endl;
 
+        std::cout
+            << "\n==================================================\n"
+            << "      전체 유도 시뮬레이션 종료\n"
+            << "==================================================\n";
     }
-
 
 
 private:
 
-    // ==================================================
-    // Phase 1:
-    // 센서 영점 초기화 및 Calibration
+    // ========================================================
+    // Phase 1
+    // Hardware Initialization & Calibration Data Loading
+    // ========================================================
     //
-    // 수행 내용:
-    // 1. Gyro Offset 측정
-    // 2. 평균 Bias 계산
-    // 3. 초기 센서 기준값 설정
+    // 기존 코드에서는 가상의 자이로 데이터를 반복 측정하여
+    // Bias를 계산했지만,
     //
-    // 현재는 테스트를 위해 고정값 사용
+    // 현재는 실제 하드웨어 측정을 통해 이미 확보한 값을
+    // calibration_data.h에서 직접 불러온다.
     //
-    // 실제 구현 시:
-    // I2C/SPI IMU 데이터 샘플링 후 평균 계산
-    // ==================================================
+    // 수행 순서
+    //
+    // 1. MPU6050 Gyro Bias 불러오기
+    // 2. Servo 초기 PWM 위치 설정
+    // 3. SM1504 중심 위치 설정
+    // 4. 초기화 완료
+    // 5. Phase 2로 상태 천이
+    // ========================================================
 
-    void processPhase1_Initializing() {
-
-        std::cout << "\n[Phase 1] 센서 영점 초기화 시작..." << std::endl;
-
-
-        // Gyro Offset 누적 변수
-        double gyroOffsetSumX = 0.0;
-        double gyroOffsetSumY = 0.0;
+    void processPhase1_Initializing()
+    {
+        std::cout
+            << "\n[Phase 1] 하드웨어 초기화 시작...\n";
 
 
-        // 센서 샘플 개수
-        int sampleCount = 20;
-
-        // ==================================================
-        // 가상 센서 데이터 측정
+        // ----------------------------------------------------
+        // 1. MPU6050 Gyro Bias
+        // ----------------------------------------------------
         //
-        // 실제:
-        // gyro 값을 반복 측정하여 평균 Bias 계산
+        // 별도의 imu_bias_measure 프로그램을 통해
+        // 실제 측정한 Bias 값을 사용한다.
         //
-        // 현재:
-        // 테스트용 고정값 입력
-        // ==================================================
+        // 최종 하드웨어 제작 후 IMU를 다시 장착하면
+        // 재측정 후 calibration_data.h의 값만 변경한다.
+        // ----------------------------------------------------
 
-        for (int i = 0; i < sampleCount; ++i) {
-            gyroOffsetSumX += 0.02;
-            gyroOffsetSumY += -0.01;
-        }
-
-
-        // 평균 Bias 계산
-        double finalBiasX = gyroOffsetSumX / sampleCount;
-        double finalBiasY = gyroOffsetSumY / sampleCount;
+        const double gyroBiasX = GYRO_X_BIAS;
+        const double gyroBiasY = GYRO_Y_BIAS;
+        const double gyroBiasZ = GYRO_Z_BIAS;
 
 
-        std::cout 
-            << " -> 자이로 오프셋 측정 완료 X: "
-            << finalBiasX
-            << " rad/s, Y: "
-            << finalBiasY
-            << " rad/s\n";
-
-        std::cout 
-            << " -> 구동기 영점 셋팅 완료. [중간 유도 단계]로 자동 천이합니다.\n";
+        std::cout
+            << " -> MPU6050 Gyro Bias 적용\n"
+            << "    X : " << gyroBiasX << '\n'
+            << "    Y : " << gyroBiasY << '\n'
+            << "    Z : " << gyroBiasZ << '\n';
 
 
-        // 초기화 완료 후 Phase 2 이동
-        m_currentState = SystemState::MIDCOURSE_GUIDE;
-
-    }    
-
-    // ==================================================
-    // Phase 2:
-    // 중간 유도 단계
-    //
-    // 목적:
-    // - 외부 명령을 통해 목표 방향 결정
-    // - 동체를 목표 방향으로 이동
-    //
-    // 현재 구현:
-    // Putty 입력을 모의 데이터로 처리
-    //
-    // 실제 구현 시:
-    // UART / RS485 / CAN 통신 등을 통해
-    // 외부 명령 수신
-    // ==================================================
-
-    void processPhase2_MidcourseGuide() {
-
-        std::cout << "\n[Phase 2] 중간 유도 단계 진입: Putty 명령 대기 중..." << std::endl;
-
-        // ==================================================
-        // 가상 UART 수신 데이터
+        // ----------------------------------------------------
+        // 2. Servo 초기 위치 설정
+        // ----------------------------------------------------
         //
-        // 실제 시스템에서는:
-        // Serial RX Buffer에서 데이터 읽기
-        //
-        // 예:
-        // '1' → 1사분면 목표
-        // ==================================================
+        // 실제 캘리브레이션을 통해 측정한
+        // PCA9685 PWM 값을 사용한다.
+        // ----------------------------------------------------
 
+        writeServoPWM(
+            "Bottom Servo",
+            SERVO_BOTTOM_INIT_PWM
+        );
+
+
+        writeServoPWM(
+            "Top Servo",
+            SERVO_TOP_INIT_PWM
+        );
+
+
+        // ----------------------------------------------------
+        // 3. SM1504 중심 위치 설정
+        // ----------------------------------------------------
+        //
+        // 스텝모터 시작 기준 위치에서
+        // 실제 측정한 중심 위치인 1690 step으로 이동한다.
+        //
+        // 추후 Homing 구조가 확정되면
+        // 기준점 확보 후 해당 위치로 이동하도록 구현한다.
+        // ----------------------------------------------------
+
+        writeLinearActuator(
+            SM1504_CENTER_STEP
+        );
+
+
+        std::cout
+            << " -> 초기화 기준값 적용 완료.\n"
+            << " -> [중간 유도 단계]로 천이합니다.\n";
+
+
+        m_currentState =
+            SystemState::MIDCOURSE_GUIDE;
+    }
+
+
+    // ========================================================
+    // Phase 2
+    // Midcourse Guidance
+    // ========================================================
+
+    void processPhase2_MidcourseGuide()
+    {
+        std::cout
+            << "\n[Phase 2] 중간 유도 단계 진입: "
+            << "외부 명령 대기 중...\n";
+
+
+        /*
+         * 아직 실제 UART/RS485 입력을 연결하지 않았으므로
+         * Mock 명령을 사용한다.
+         *
+         * 추후 통신 라이브러리 연결 시 실제 수신값으로 교체한다.
+         */
         char mockPuttyInput = '1';
 
 
-        // 목표 자세 초기화
         double targetX = 0.0;
         double targetY = 0.0;
 
-        // ==================================================
-        // 입력 명령에 따른 목표 방향 설정
-        //
-        // 현재는 '1' 입력 시
-        // X축 22.5도
-        // Y축 15도
-        // 로 이동
-        // ==================================================
 
-        if (mockPuttyInput == '1') {
+        if (mockPuttyInput == '1')
+        {
             targetX = 22.5;
             targetY = 15.0;
         }
 
-        std::cout 
-            << " -> [Putty] '1' 수신. 목표 사분면 확정 -> X: "
+
+        std::cout
+            << " -> [Command] '1' 수신"
+            << " | 목표 X: "
             << targetX
-            << "도, Y: "
+            << "도"
+            << " | 목표 Y: "
             << targetY
             << "도\n";
 
-        // ==================================================
-        // 목표 방향까지 동체 이동
-        //
-        // 현재 방식:
-        // 최대 각속도 제한을 적용한 단순 위치 제어
-        //
-        // MAX_ANGULAR_VELOCITY:
-        // 한 루프당 이동 가능한 최대 각도
-        //
-        // 목적:
-        // 급격한 조향 방지
-        // ==================================================
 
-        while (m_currentBodyX < targetX || 
-               m_currentBodyY < targetY) {
-
-
-            // X축 이동
+        while (
+            m_currentBodyX < targetX ||
+            m_currentBodyY < targetY
+        )
+        {
             if (m_currentBodyX < targetX)
+            {
+                m_currentBodyX +=
+                    ControlConstants::MAX_ANGULAR_VELOCITY;
+            }
 
-                m_currentBodyX += ControlConstants::MAX_ANGULAR_VELOCITY;
 
-
-            // Y축 이동
             if (m_currentBodyY < targetY)
+            {
+                m_currentBodyY +=
+                    ControlConstants::MAX_ANGULAR_VELOCITY;
+            }
 
-                m_currentBodyY += ControlConstants::MAX_ANGULAR_VELOCITY;
 
-            // ==================================================
-            // 목표값 초과 방지
-            //
-            // Overshoot 발생 시
-            // 목표값으로 제한
-            // ==================================================
-
+            /*
+             * 목표값을 초과하지 않도록 제한한다.
+             */
             if (m_currentBodyX > targetX)
+            {
                 m_currentBodyX = targetX;
+            }
+
 
             if (m_currentBodyY > targetY)
+            {
                 m_currentBodyY = targetY;
+            }
 
 
-            // 현재 동체 각도 출력
-            std::cout 
-                << " [기동중] 동체 절대 각도 -> X: "
+            std::cout
+                << " [기동중] 동체 절대 각도"
+                << " | X: "
                 << m_currentBodyX
-                << "도, Y: "
+                << "도"
+                << " | Y: "
                 << m_currentBodyY
                 << "도\n";
 
 
-            // 제어 주기 유지
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(20)
+                std::chrono::milliseconds(
+                    static_cast<long long>(
+                        ControlConstants::LOOP_TIME_MS
+                    )
+                )
             );
-
         }
 
-        // ==================================================
-        // 목표 사분면 도달
-        //
-        // 다음 단계:
-        // 시커 활성화 및 종말 유도 진입
-        // ==================================================
 
-        std::cout 
-            << " -> [목표 사분면 도달] 시커 센서를 활성화하고 [종말 유도 단계]로 진입합니다.\n";
+        std::cout
+            << " -> 목표 사분면 도달\n"
+            << " -> [종말 유도 단계]로 천이합니다.\n";
 
 
-        // Phase 3 상태 변경
-        m_currentState = SystemState::TERMINAL_LOCKON;
+        m_currentState =
+            SystemState::TERMINAL_LOCKON;
+    }
 
-    }    
-    
-    // ==================================================
-    // Phase 3:
-    // 종말 유도 단계
+
+    // ========================================================
+    // Phase 3
+    // Terminal Guidance / Seeker Lock-On
+    // ========================================================
     //
-    // 목적:
-    // - 시커(Seeker)를 이용하여 목표 추적
-    // - 목표와 현재 시커 방향의 오차 계산
-    // - 오차 기반 짐벌 제어 수행
-    // - 일정 시간 안정적으로 추적 시 Lock-On 판단
+    // 현재 추적 알고리즘은 유지한다.
     //
-    // 현재 구현:
-    // P 제어 + Gyro 각속도 역보상 구조
-    //
-    // 실제 구현 시:
-    // - 초음파 센서 입력
-    // - IMU Gyro 데이터
-    // - Servo PWM 출력
-    // 연결 필요
-    // ==================================================
+    // 초음파 센서 및 MPU6050 실시간 입력은
+    // 추후 외부 라이브러리를 연결하면서 교체한다.
+    // ========================================================
 
-    void processPhase3_TerminalLockOn() {
-
-        std::cout << "\n[Phase 3] 종말 유도 단계 진입: 시커 고속 추적 및 역보정 가동" << std::endl;
-
-        // ==================================================
-        // 제어 주기 변환
-        //
-        // ms → sec 변환
-        //
-        // 각속도(deg/s)를 각도 변화량으로 변환할 때 사용
-        // ==================================================
-
-        double dt = ControlConstants::LOOP_TIME_MS / 1000.0;
+    void processPhase3_TerminalLockOn()
+    {
+        std::cout
+            << "\n[Phase 3] 종말 유도 단계 진입: "
+            << "시커 추적 시작\n";
 
 
-        // 목표 추적 루프
-        while (true) {
+        /*
+         * 제어 주기를 초 단위로 변환한다.
+         *
+         * Gyro Rate(deg/s)를 이용하여
+         * 한 제어 주기 동안 발생한 각도 변화를 계산하기 위해 사용한다.
+         */
+        const double dt =
+            ControlConstants::LOOP_TIME_MS / 1000.0;
 
-            // ==================================================
-            // 시커 기준 목표 오차 계산
+
+        while (true)
+        {
+            // ------------------------------------------------
+            // 현재는 알고리즘 검증용 Mock 목표값 사용
             //
-            // 목표 위치 - 현재 시커 방향
-            //
-            // 오차가 크면 더 큰 방향 보정 필요
-            // ==================================================
+            // 추후 이 부분은 3개의 초음파 센서 거리값을
+            // 입력으로 받는 타겟 방향 계산 함수로 교체한다.
+            // ------------------------------------------------
 
-            double seekerErrorX = m_mockTargetX - m_seekerYawAngle;
-            double seekerErrorY = m_mockTargetY - m_seekerPitchAngle;
+            double seekerErrorX =
+                m_mockTargetX -
+                m_seekerYawAngle;
 
-            // ==================================================
-            // 추적 Gain
-            //
-            // 현재는 P 제어 계수
-            //
-            // 최적화 단계에서는:
-            // Gain 변화에 따른
-            // 응답 속도 / Overshoot / 안정시간 비교 가능
-            // ==================================================
 
-            double trackingGain = 0.3;
+            double seekerErrorY =
+                m_mockTargetY -
+                m_seekerPitchAngle;
 
-            // ==================================================
-            // 시커 이동량 계산
-            //
-            // 오차 보정:
-            // Error × Gain
-            //
-            // Gyro 역보상:
-            // 외란으로 발생하는 회전을 상쇄
-            // ==================================================
 
+            /*
+             * 시커 P 제어 Gain
+             */
+            const double trackingGain = 0.3;
+
+
+            /*
+             * 목표 추적 보정량
+             *
+             * Target Error 기반 P 제어
+             * +
+             * Gyro Rate 역보상
+             */
             double deltaYaw =
                 (seekerErrorX * trackingGain)
-                - (m_gyroYawRate * dt);
+                -
+                (m_gyroYawRate * dt);
+
 
             double deltaPitch =
                 (seekerErrorY * trackingGain)
-                - (m_gyroPitchRate * dt);
+                -
+                (m_gyroPitchRate * dt);
 
-
-            // 계산된 보정량 적용
 
             m_seekerYawAngle += deltaYaw;
             m_seekerPitchAngle += deltaPitch;
 
-            // ==================================================
-            // Servo 출력용 절대각 변환
-            //
-            // Servo 중앙 위치:
-            // 90도
-            //
-            // 상대각 + 중심각 = 실제 출력각
-            // ==================================================
 
+            /*
+             * 알고리즘 내부 논리 중심각 90도를 기준으로
+             * 현재 시커 절대 방향을 계산한다.
+             *
+             * 실제 Servo PWM 중심값은
+             * calibration_data.h의 값을 사용한다.
+             */
             double finalScaleYaw =
                 ControlConstants::SEEKER_YAW_CENTER
-                + m_seekerYawAngle;
+                +
+                m_seekerYawAngle;
+
 
             double finalScalePitch =
                 ControlConstants::SEEKER_PITCH_CENTER
-                + m_seekerPitchAngle;
+                +
+                m_seekerPitchAngle;
 
 
-            std::cout 
-                << " [추적중] 시커 오차 -> X: "
+            std::cout
+                << " [추적중]"
+                << " Error X: "
                 << seekerErrorX
-                << "도, Y: "
-                << seekerErrorY 
-                << "도 | 짐벌 출력 -> Yaw: "
+                << "도"
+                << " | Error Y: "
+                << seekerErrorY
+                << "도"
+                << " | Yaw: "
                 << finalScaleYaw
-                << "도, Pitch: "
+                << "도"
+                << " | Pitch: "
                 << finalScalePitch
                 << "도\n";
 
-            // ==================================================
+
+            // ------------------------------------------------
             // Lock-On 판단
-            //
-            // 오차가 기준값 이하일 경우
-            // 안정화 카운터 증가
-            //
-            // 일정 횟수 이상 유지:
-            // → 실제 추적 성공 판단
-            // ==================================================
+            // ------------------------------------------------
 
-            if (std::abs(seekerErrorX) <= ControlConstants::LOCKON_THRESHOLD && 
-                std::abs(seekerErrorY) <= ControlConstants::LOCKON_THRESHOLD) {
+            if (
+                std::abs(seekerErrorX)
+                    <= ControlConstants::LOCKON_THRESHOLD
+                &&
+                std::abs(seekerErrorY)
+                    <= ControlConstants::LOCKON_THRESHOLD
+            )
+            {
+                ++m_stableLockCount;
 
-                m_stableLockCount++;
 
-                // 5회 연속 조건 만족 시 Lock-On 성공
-                if (m_stableLockCount >= 5) {
+                /*
+                 * 5회 연속 오차 조건 만족 시
+                 * 안정적인 Lock-On으로 판단한다.
+                 */
+                if (m_stableLockCount >= 5)
+                {
+                    std::cout
+                        << "\n -> [LOCK-ON SUCCESS]\n";
 
-                    std::cout << "\n -> 🎯 [LOCK-ON SUCCESS] 타겟 록온 안착! 제어권 이관.\n";
 
-                    // ==================================================
-                    // Phase 4 전달 데이터 저장
-                    //
-                    // 시커 절대 방향 정보를 저장하여
-                    // 이후 동체 정렬에 사용
-                    // ==================================================
+                    /*
+                     * Phase 4에서 동체 정렬에 사용할
+                     * 시커의 절대 방향을 저장한다.
+                     */
+                    m_seekerAbsYaw =
+                        finalScaleYaw;
 
-                    m_seekerAbsYaw = finalScaleYaw;
-                    m_seekerAbsPitch = finalScalePitch;
+
+                    m_seekerAbsPitch =
+                        finalScalePitch;
+
 
                     break;
-
                 }
             }
 
-            else {
-
-                // 오차가 다시 증가하면
-                // 안정화 조건 초기화
+            else
+            {
+                /*
+                 * 오차 조건을 벗어나면
+                 * 안정화 카운터를 다시 초기화한다.
+                 */
                 m_stableLockCount = 0;
-
             }
 
 
-            // 20ms 제어 주기 유지
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(20)
+                std::chrono::milliseconds(
+                    static_cast<long long>(
+                        ControlConstants::LOOP_TIME_MS
+                    )
+                )
             );
-
         }
 
 
-        // Phase 4 이동
-        m_currentState = SystemState::BODY_TRACKING;
+        m_currentState =
+            SystemState::BODY_TRACKING;
+    }
 
-    }    
-    
-    // ==================================================
-    // Phase 4:
-    // 최종 동체 고정 추종 단계
+
+    // ========================================================
+    // Phase 4
+    // Body Tracking
+    // ========================================================
     //
-    // 목적:
-    // - 시커가 바라보는 방향과 동체 방향 정렬
-    // - 최종적으로 동체 축과 목표 방향 일치
+    // 시커가 바라보는 방향을 기준으로
+    // 동체를 정렬한다.
     //
-    // 현재 구현:
-    // P 제어(Proportional Control)
-    //
-    // 제어식:
-    //
-    // 이동량 = 오차 × Kp
-    //
-    // 추후 개선:
-    // P → PD → PID 제어 비교 가능
-    // ==================================================
+    // 현재는 P 제어 기반 Mock 동체 모델을 유지한다.
+    // ========================================================
 
-    void processPhase4_BodyTracking() {
-
-        std::cout << "\n[Phase 4] 최종 동체 추종 단계 진입: 시커-동체 정렬 가동" << std::endl;
-
-        // ==================================================
-        // 비례 제어 Gain
-        //
-        // Kp가 클수록:
-        // - 빠른 응답
-        // - Overshoot 가능성 증가
-        //
-        // Kp가 작을수록:
-        // - 안정성 증가
-        // - 응답 속도 감소
-        //
-        // 최적화 과정에서 튜닝 대상
-        // ==================================================
-
-        double bodyKpX = 0.25;
-        double bodyKpY = 0.20;
+    void processPhase4_BodyTracking()
+    {
+        std::cout
+            << "\n[Phase 4] 동체-시커 정렬 시작\n";
 
 
-        while (true) {
+        /*
+         * 동체 P 제어 Gain
+         *
+         * 추후 실험을 통해 튜닝한다.
+         */
+        const double bodyKpX = 0.25;
+        const double bodyKpY = 0.20;
 
-            // ==================================================
-            // 시커와 동체 사이 방향 오차 계산
-            //
-            // 시커 중심각(90도)을 기준으로
-            // 현재 얼마나 틀어져 있는지 계산
-            //
-            // 예:
-            // seekerAbsYaw = 105도
-            //
-            // 105 - 90 = 15도
-            //
-            // → 동체가 15도 이동 필요
-            // ==================================================
 
+        while (true)
+        {
+            /*
+             * 시커 중심축과 동체 사이의 방향 오차
+             */
             double bodyErrorX =
-                m_seekerAbsYaw - ControlConstants::SEEKER_YAW_CENTER;
+                m_seekerAbsYaw
+                -
+                ControlConstants::SEEKER_YAW_CENTER;
+
 
             double bodyErrorY =
-                m_seekerAbsPitch - ControlConstants::SEEKER_PITCH_CENTER;
+                m_seekerAbsPitch
+                -
+                ControlConstants::SEEKER_PITCH_CENTER;
 
-            // ==================================================
-            // 최종 정렬 완료 판단
-            //
-            // Yaw/Pitch 오차가 모두 허용범위 이하이면
-            // 정렬 완료
-            // ==================================================
 
-            if (std::abs(bodyErrorX) <= ControlConstants::TRACKING_TOLERANCE && 
-                std::abs(bodyErrorY) <= ControlConstants::TRACKING_TOLERANCE) {
+            /*
+             * 최종 정렬 완료 판정
+             */
+            if (
+                std::abs(bodyErrorX)
+                    <= ControlConstants::TRACKING_TOLERANCE
+                &&
+                std::abs(bodyErrorY)
+                    <= ControlConstants::TRACKING_TOLERANCE
+            )
+            {
+                std::cout
+                    << "\n -> [ALIGNMENT COMPLETE]\n";
 
-                std::cout << "\n🎯 [ALIGNMENT COMPLETE] 동체-시커 정렬 최종 완료. 돌격!\n";
 
                 break;
-
             }
 
-            // ==================================================
-            // P 제어 입력 계산
-            //
-            // 오차 크기에 비례하여
-            // 이번 제어 루프에서 이동할 양 결정
-            //
-            // 이동량 = Error × Kp
-            // ==================================================
 
-            double bodyMoveX = bodyErrorX * bodyKpX;
-            double bodyMoveY = bodyErrorY * bodyKpY;
+            /*
+             * P 제어
+             *
+             * 이동량 = Error × Kp
+             */
+            double bodyMoveX =
+                bodyErrorX * bodyKpX;
 
 
-            // 계산된 제어량만큼 동체 각도 변경
+            double bodyMoveY =
+                bodyErrorY * bodyKpY;
 
+
+            /*
+             * 현재 Mock 동체 모델에 제어량 적용
+             */
             m_currentBodyX += bodyMoveX;
             m_currentBodyY += bodyMoveY;
 
-            // ==================================================
-            // 동체가 이동하면 시커 기준 오차 감소
-            //
-            // 실제 시스템에서는:
-            // - IMU
-            // - Encoder
-            // - Gimbal Angle Sensor
-            //
-            // 값을 이용해 계산
-            // ==================================================
 
+            /*
+             * 동체가 시커 방향으로 이동했다고 가정하여
+             * 시커-동체 상대 오차를 감소시킨다.
+             *
+             * 실제 하드웨어에서는 IMU 등의
+             * 실제 피드백값으로 대체한다.
+             */
             m_seekerAbsYaw -= bodyMoveX;
             m_seekerAbsPitch -= bodyMoveY;
 
 
-            std::cout 
-                << " [정렬중] 동체 조향 오차 -> X: "
+            std::cout
+                << " [정렬중]"
+                << " Error X: "
                 << bodyErrorX
-                << "도, Y: "
-                << bodyErrorY 
-                << "도 | 동체 절대각 -> X: "
+                << "도"
+                << " | Error Y: "
+                << bodyErrorY
+                << "도"
+                << " | Body X: "
                 << m_currentBodyX
-                << "도, Y: "
+                << "도"
+                << " | Body Y: "
                 << m_currentBodyY
                 << "도\n";
 
 
-            // 제어 주기 유지
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(20)
+                std::chrono::milliseconds(
+                    static_cast<long long>(
+                        ControlConstants::LOOP_TIME_MS
+                    )
+                )
             );
-
         }
 
 
-
-
-
-        // 모든 Phase 완료
-        m_currentState = SystemState::MISSION_COMPLETE;
-
+        m_currentState =
+            SystemState::MISSION_COMPLETE;
     }
-
 };
 
-// ==================================================
-// Main 함수
-//
-// IntegratedMissileController 객체 생성 후
-// 전체 상태 머신 실행
-// ==================================================
 
-int main() {
+// ============================================================
+// Main
+// ============================================================
 
+int main()
+{
+    /*
+     * 종합 유도 제어기 생성
+     */
     IntegratedMissileController controller;
 
-    // Phase 1 → Phase 4 순차 실행
+
+    /*
+     * Phase 1 → Phase 4 상태 머신 실행
+     */
     controller.runSystem();
 
-    return 0;
 
+    return 0;
 }
+```
