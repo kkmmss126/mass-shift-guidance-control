@@ -5,31 +5,15 @@
  * A4988 스텝모터 드라이버를 이용해 스텝모터 또는
  * 리니어 스텝모터 액추에이터를 제어하기 위한 클래스 선언 파일이다.
  *
- * 이 파일에는 클래스의 구조와 외부에서 사용할 수 있는 함수만 선언한다.
- * 실제 GPIO 제어 동작은 StepperMotor.cpp에 구현한다.
+ * libgpiod 2.x API를 기준으로 작성한다.
  *
  * Project:
  * 질량 이동 기반 중간 및 종말 유도 모사 시스템
- *
- * 주요 기능:
- * 1. GPIO 초기화
- * 2. 모터 이동 방향 설정
- * 3. STEP 펄스 생성
- * 4. A4988 드라이버 활성화 및 비활성화
- * 5. 현재 모터 위치를 Step 단위로 관리
- *
- * 적용 대상:
- * - 질량 이동용 리니어 액추에이터
- * - 기체 자세 제어용 스텝모터
- * - A4988과 STEP/DIR 방식으로 연결된 모터
  */
+
 #ifndef STEPPER_MOTOR_H
 #define STEPPER_MOTOR_H
 
-/*
- * libgpiod를 사용해 라즈베리파이 GPIO 칩과
- * 개별 GPIO 라인에 접근한다.
- */
 #include <gpiod.h>
 
 /*
@@ -42,7 +26,7 @@ public:
         int stepPin,
         int dirPin,
         int enablePin = -1,
-        const char* chipName = "gpiochip0"
+        const char* chipPath = "/dev/gpiochip0"
     );
 
     ~StepperMotor();
@@ -54,10 +38,10 @@ public:
     // 양수: 정방향, 음수: 역방향
     bool moveSteps(int steps);
 
-    // 펄스의 HIGH/LOW 유지시간 설정
+    // STEP 펄스의 HIGH/LOW 유지시간 설정
     void setPulseDelay(int microseconds);
 
-    // 드라이버 활성화/비활성화
+    // A4988 드라이버 활성화/비활성화
     void enable();
     void disable();
 
@@ -67,10 +51,15 @@ public:
     // 현재 위치값 강제 지정
     void setCurrentPosition(long position);
 
+    // GPIO 초기화 여부 확인
     bool isInitialized() const;
 
 private:
-    const char* chipName_;
+    /*
+     * libgpiod 2.x에서는 GPIO 칩 이름이 아니라
+     * "/dev/gpiochip0" 같은 장치 경로를 사용한다.
+     */
+    const char* chipPath_;
 
     int stepPin_;
     int dirPin_;
@@ -81,11 +70,25 @@ private:
 
     bool initialized_;
 
+    /*
+     * libgpiod 2.x에서는 gpiod_line을 직접 보관하지 않고
+     * line_request 객체 하나를 통해 여러 GPIO를 제어한다.
+     */
     gpiod_chip* chip_;
-    gpiod_line* stepLine_;
-    gpiod_line* dirLine_;
-    gpiod_line* enableLine_;
+    gpiod_line_request* request_;
 
+    /*
+     * GPIO 요청에 사용할 offset 목록을 저장한다.
+     *
+     * enablePin이 없는 경우에는 STEP과 DIR 두 개만 사용하고,
+     * enablePin이 있는 경우에는 세 개를 사용한다.
+     */
+    unsigned int offsets_[3];
+    unsigned int offsetCount_;
+
+    /*
+     * GPIO 자원 해제 함수
+     */
     void releaseGPIO();
 };
 

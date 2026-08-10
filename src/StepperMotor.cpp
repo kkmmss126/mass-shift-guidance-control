@@ -5,41 +5,37 @@
  * A4988 스텝모터 드라이버를 이용하여 스텝모터 또는
  * 리니어 스텝모터 액추에이터를 제어하는 클래스 구현 파일이다.
  *
- * libgpiod를 이용해 라즈베리파이 GPIO를 제어하며,
- * STEP 펄스 생성, 회전 방향 설정, 드라이버 활성화 및
- * 현재 위치값 관리를 수행한다.
- *
- * Project:
- * 질량 이동 기반 중간 및 종말 유도 모사 시스템
+ * libgpiod 2.x API를 사용하여 Raspberry Pi GPIO를 제어한다.
  *
  * 주요 기능:
- * 1. GPIO 칩 및 GPIO Line 초기화
- * 2. A4988 STEP/DIR/ENABLE 신호 제어
- * 3. 지정한 Step 수만큼 모터 이동
- * 4. 이동 명령을 기준으로 현재 위치 계산
- * 5. 프로그램 종료 시 GPIO 자원 해제
+ * 1. STEP, DIR, ENABLE GPIO 출력 설정
+ * 2. STEP 펄스 생성
+ * 3. 이동 방향 설정
+ * 4. A4988 활성화 및 비활성화
+ * 5. 논리적 현재 위치 관리
  */
 
 #include "StepperMotor.h"
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <thread>
 
 /*
- * 사용할 GPIO 번호와 기본 상태를 저장한다.
+ * 생성자
  *
- * 생성자에서는 GPIO를 실제로 점유하지 않으며,
- * GPIO 초기화는 initialize() 함수에서 수행한다.
+ * GPIO 번호와 기본 설정값만 저장한다.
+ * 실제 GPIO 점유는 initialize() 함수에서 수행한다.
  */
 StepperMotor::StepperMotor(
     int stepPin,
     int dirPin,
     int enablePin,
-    const char* chipName
+    const char* chipPath
 )
-    : chipName_(chipName),
+    : chipPath_(chipPath),
       stepPin_(stepPin),
       dirPin_(dirPin),
       enablePin_(enablePin),
@@ -47,15 +43,17 @@ StepperMotor::StepperMotor(
       currentPosition_(0),
       initialized_(false),
       chip_(nullptr),
-      stepLine_(nullptr),
-      dirLine_(nullptr),
-      enableLine_(nullptr)
+      request_(nullptr),
+      offsets_{0, 0, 0},
+      offsetCount_(0)
 {
 }
 
 /*
- * 객체가 소멸될 때 모터 드라이버를 비활성화하고
- * 점유하고 있던 GPIO 자원을 해제한다.
+ * 소멸자
+ *
+ * 객체가 제거될 때 드라이버를 비활성화하고
+ * GPIO 요청 및 GPIO 칩 자원을 해제한다.
  */
 StepperMotor::~StepperMotor()
 {
@@ -64,114 +62,233 @@ StepperMotor::~StepperMotor()
 }
 
 /*
- * STEP, DIR, ENABLE GPIO를 출력 모드로 설정하고
- * A4988을 제어할 수 있는 상태로 초기화한다.
+ * GPIO 초기화
+ *
+ * libgpiod 2.x에서는 개별 gpiod_line 객체를 가져오는 대신,
+ * 사용할 GPIO offset들을 하나의 line_request로 묶어서 요청한다.
  */
 bool StepperMotor::initialize()
 {
-    // 지정한 GPIO 칩을 연다. 라즈베리파이에서는 일반적으로 gpiochip0을 사용한다.
-    chip_ = gpiod_chip_open_by_name(chipName_);
+    /*
+     * 이미 초기화된 경우 중복 요청을 방지한다.
+     */
+    if (initialized_)
+    {
+        return true;
+    }
+
+    /*
+     * GPIO 칩 장치 파일을 연다.
+     *
+     * 일반적인 Raspberry Pi 4에서는:
+     * /dev/gpiochip0
+     */
+    chip_ = gpiod_chip_open(chipPath_);
 
     if (chip_ == nullptr)
     {
-        std::cerr << "GPIO chip open failed: "
-                  << chipName_ << '\n';
+        std::cerr
+            << "GPIO chip open failed: "
+            << chipPath_
+            << '\n';
+
         return false;
     }
 
-    // GPIO 칩에서 STEP 및 DIR 핀에 해당하는 GPIO Line을 가져온다.
-    stepLine_ = gpiod_chip_get_line(chip_, stepPin_);
-    dirLine_ = gpiod_chip_get_line(chip_, dirPin_);
+    /*
+     * 사용할 GPIO offset 배열을 구성한다.
+     *
+     * BCM GPIO 번호와 gpiochip offset이 같은 환경을 기준으로 한다.
+     */
+    offsets_[0] = static_cast<unsigned int>(stepPin_);
+    offsets_[1] = static_cast<unsigned int>(dirPin_);
+    offsetCount_ = 2;
 
-    if (stepLine_ == nullptr || dirLine_ == nullptr)
+    /*
+     * ENABLE 핀을 사용하는 경우 세 번째 offset으로 추가한다.
+     */
+    if (enablePin_ >= 0)
     {
-        std::cerr << "STEP 또는 DIR GPIO line 획득 실패\n";
-        releaseGPIO();
-        return false;
+        offsets_[2] = static_cast<unsigned int>(enablePin_);
+        offsetCount_ = 3;
     }
 
-    // STEP 핀을 초기값 LOW인 출력 핀으로 설정한다.
-    if (gpiod_line_request_output(
-            stepLine_,
-            "stepper-step",
-            0) < 0)
-    {
-        std::cerr << "STEP GPIO 출력 설정 실패\n";
-        releaseGPIO();
-        return false;
-    }
+    /*
+     * 모든 GPIO에 공통으로 적용할 출력 설정 객체를 생성한다.
+     */
+    gpiod_line_settings* settings =
+        gpiod_line_settings_new();
 
-    // DIR 핀을 초기값 LOW인 출력 핀으로 설정한다.
-    if (gpiod_line_request_output(
-            dirLine_,
-            "stepper-dir",
-            0) < 0)
+    if (settings == nullptr)
     {
-        std::cerr << "DIR GPIO 출력 설정 실패\n";
+        std::cerr << "GPIO line settings 생성 실패\n";
         releaseGPIO();
         return false;
     }
 
     /*
-     * enablePin이 -1이면 ENABLE 핀을 사용하지 않는다.
-     * ENABLE 핀을 연결한 경우에만 GPIO를 초기화한다.
+     * STEP, DIR, ENABLE 핀을 출력 모드로 설정한다.
      */
-    if (enablePin_ >= 0)
+    if (gpiod_line_settings_set_direction(
+            settings,
+            GPIOD_LINE_DIRECTION_OUTPUT) < 0)
     {
-        enableLine_ = gpiod_chip_get_line(chip_, enablePin_);
+        std::cerr << "GPIO 출력 방향 설정 실패\n";
 
-        if (enableLine_ == nullptr)
-        {
-            std::cerr << "ENABLE GPIO line 획득 실패\n";
-            releaseGPIO();
-            return false;
-        }
+        gpiod_line_settings_free(settings);
+        releaseGPIO();
 
-        /*
-         * A4988의 ENABLE 핀은 Active Low 방식이다.
-         *
-         * HIGH: 드라이버 비활성화
-         * LOW : 드라이버 활성화
-         *
-         * 초기값을 HIGH로 설정하여 GPIO 초기화 중
-         * 모터가 의도하지 않게 움직이는 것을 방지한다.
-         */
-        if (gpiod_line_request_output(
-                enableLine_,
-                "stepper-enable",
-                1) < 0)
-        {
-            std::cerr << "ENABLE GPIO 출력 설정 실패\n";
-            releaseGPIO();
-            return false;
-        }
+        return false;
+    }
+
+    /*
+     * 요청 직후 기본 출력값은 LOW로 설정한다.
+     *
+     * STEP = LOW
+     * DIR = LOW
+     *
+     * ENABLE은 Active Low이므로, 요청 완료 후 별도로 HIGH를 출력해
+     * 초기화 과정에서 모터가 활성화되는 시간을 최소화한다.
+     */
+    if (gpiod_line_settings_set_output_value(
+            settings,
+            GPIOD_LINE_VALUE_INACTIVE) < 0)
+    {
+        std::cerr << "GPIO 초기 출력값 설정 실패\n";
+
+        gpiod_line_settings_free(settings);
+        releaseGPIO();
+
+        return false;
+    }
+
+    /*
+     * GPIO offset과 설정을 연결하기 위한 line config를 생성한다.
+     */
+    gpiod_line_config* lineConfig =
+        gpiod_line_config_new();
+
+    if (lineConfig == nullptr)
+    {
+        std::cerr << "GPIO line config 생성 실패\n";
+
+        gpiod_line_settings_free(settings);
+        releaseGPIO();
+
+        return false;
+    }
+
+    /*
+     * STEP, DIR, ENABLE에 동일한 출력 설정을 적용한다.
+     */
+    if (gpiod_line_config_add_line_settings(
+            lineConfig,
+            offsets_,
+            offsetCount_,
+            settings) < 0)
+    {
+        std::cerr
+            << "GPIO offset 설정 추가 실패: "
+            << std::strerror(errno)
+            << '\n';
+
+        gpiod_line_config_free(lineConfig);
+        gpiod_line_settings_free(settings);
+        releaseGPIO();
+
+        return false;
+    }
+
+    /*
+     * GPIO 요청의 이름을 설정한다.
+     *
+     * gpioinfo 명령에서 어떤 프로그램이 GPIO를 사용 중인지
+     * 확인할 때 표시된다.
+     */
+    gpiod_request_config* requestConfig =
+        gpiod_request_config_new();
+
+    if (requestConfig == nullptr)
+    {
+        std::cerr << "GPIO request config 생성 실패\n";
+
+        gpiod_line_config_free(lineConfig);
+        gpiod_line_settings_free(settings);
+        releaseGPIO();
+
+        return false;
+    }
+
+    gpiod_request_config_set_consumer(
+        requestConfig,
+        "stepper-motor"
+    );
+
+    /*
+     * 설정된 GPIO들을 하나의 요청 객체로 점유한다.
+     */
+    request_ = gpiod_chip_request_lines(
+        chip_,
+        requestConfig,
+        lineConfig
+    );
+
+    /*
+     * line request가 생성된 뒤 설정 객체는 더 이상 필요하지 않다.
+     */
+    gpiod_request_config_free(requestConfig);
+    gpiod_line_config_free(lineConfig);
+    gpiod_line_settings_free(settings);
+
+    if (request_ == nullptr)
+    {
+        std::cerr
+            << "GPIO line request 실패: "
+            << std::strerror(errno)
+            << '\n';
+
+        releaseGPIO();
+        return false;
     }
 
     initialized_ = true;
 
-    // GPIO 설정이 완료된 뒤 A4988 드라이버를 활성화한다.
+    /*
+     * ENABLE 핀을 사용한다면 먼저 비활성화 상태로 만든다.
+     *
+     * A4988 ENABLE:
+     * HIGH = 비활성화
+     * LOW  = 활성화
+     */
+    disable();
+
+    /*
+     * GPIO 초기화가 완료된 뒤 드라이버를 활성화한다.
+     */
     enable();
 
     return true;
 }
 
 /*
- * 지정한 Step 수만큼 모터를 이동시킨다.
+ * 지정한 Step 수만큼 이동한다.
  *
- * 양수: DIR 핀을 HIGH로 설정하고 정방향 이동
- * 음수: DIR 핀을 LOW로 설정하고 역방향 이동
- *
- * A4988은 STEP 핀의 상승 에지마다 모터를 한 Step 이동시킨다.
+ * 양수: DIR HIGH
+ * 음수: DIR LOW
  */
 bool StepperMotor::moveSteps(int steps)
 {
-    if (!initialized_)
+    if (!initialized_ || request_ == nullptr)
     {
-        std::cerr << "StepperMotor가 초기화되지 않았습니다.\n";
+        std::cerr
+            << "StepperMotor가 초기화되지 않았습니다.\n";
+
         return false;
     }
 
-    // 이동량이 0이면 GPIO 신호를 출력하지 않고 정상 종료한다.
+    /*
+     * 이동량이 0이면 신호를 출력하지 않는다.
+     */
     if (steps == 0)
     {
         return true;
@@ -180,34 +297,53 @@ bool StepperMotor::moveSteps(int steps)
     const bool positiveDirection = steps > 0;
     const int stepCount = std::abs(steps);
 
-    // 이동 방향에 따라 DIR 핀의 출력값을 설정한다.
-    if (gpiod_line_set_value(
-            dirLine_,
-            positiveDirection ? 1 : 0) < 0)
+    /*
+     * 이동 방향 설정
+     */
+    const gpiod_line_value directionValue =
+        positiveDirection
+            ? GPIOD_LINE_VALUE_ACTIVE
+            : GPIOD_LINE_VALUE_INACTIVE;
+
+    if (gpiod_line_request_set_value(
+            request_,
+            static_cast<unsigned int>(dirPin_),
+            directionValue) < 0)
     {
-        std::cerr << "DIR GPIO 출력 실패\n";
+        std::cerr
+            << "DIR GPIO 출력 실패: "
+            << std::strerror(errno)
+            << '\n';
+
         return false;
     }
 
     /*
-     * DIR 신호가 변경된 직후 STEP 펄스를 출력하면
-     * 드라이버가 방향 신호를 안정적으로 인식하지 못할 수 있다.
+     * DIR 값이 안정된 뒤 STEP 신호를 출력한다.
      */
     std::this_thread::sleep_for(
         std::chrono::microseconds(10)
     );
 
     /*
-     * STEP 핀에 HIGH와 LOW를 반복 출력한다.
-     *
-     * LOW → HIGH 상승 에지가 한 번 발생할 때마다
-     * A4988이 모터를 한 Step 이동시킨다.
+     * STEP 핀의 LOW → HIGH 상승 에지마다
+     * A4988이 한 스텝씩 이동한다.
      */
     for (int i = 0; i < stepCount; ++i)
     {
-        if (gpiod_line_set_value(stepLine_, 1) < 0)
+        /*
+         * STEP HIGH
+         */
+        if (gpiod_line_request_set_value(
+                request_,
+                static_cast<unsigned int>(stepPin_),
+                GPIOD_LINE_VALUE_ACTIVE) < 0)
         {
-            std::cerr << "STEP HIGH 출력 실패\n";
+            std::cerr
+                << "STEP HIGH 출력 실패: "
+                << std::strerror(errno)
+                << '\n';
+
             return false;
         }
 
@@ -215,9 +351,19 @@ bool StepperMotor::moveSteps(int steps)
             std::chrono::microseconds(pulseDelayUs_)
         );
 
-        if (gpiod_line_set_value(stepLine_, 0) < 0)
+        /*
+         * STEP LOW
+         */
+        if (gpiod_line_request_set_value(
+                request_,
+                static_cast<unsigned int>(stepPin_),
+                GPIOD_LINE_VALUE_INACTIVE) < 0)
         {
-            std::cerr << "STEP LOW 출력 실패\n";
+            std::cerr
+                << "STEP LOW 출력 실패: "
+                << std::strerror(errno)
+                << '\n';
+
             return false;
         }
 
@@ -227,8 +373,8 @@ bool StepperMotor::moveSteps(int steps)
     }
 
     /*
-     * 센서나 엔코더로 측정한 실제 위치가 아니라,
-     * 출력한 Step 수를 누적하여 논리적 현재 위치를 계산한다.
+     * 실제 엔코더 위치가 아니라,
+     * 출력한 Step 수를 기준으로 논리적 위치를 누적한다.
      */
     if (positiveDirection)
     {
@@ -243,14 +389,13 @@ bool StepperMotor::moveSteps(int steps)
 }
 
 /*
- * STEP 펄스의 HIGH 및 LOW 유지시간을 설정한다.
- *
- * 값이 작을수록 모터가 빠르게 움직이지만,
- * 너무 빠르면 탈조나 토크 부족이 발생할 수 있다.
+ * STEP 펄스 HIGH 및 LOW 유지시간 설정
  */
 void StepperMotor::setPulseDelay(int microseconds)
 {
-    // 지나치게 짧은 펄스 설정을 방지하기 위한 최소 제한값이다.
+    /*
+     * 너무 빠른 펄스는 탈조와 토크 부족을 유발할 수 있다.
+     */
     if (microseconds < 100)
     {
         std::cerr
@@ -265,34 +410,62 @@ void StepperMotor::setPulseDelay(int microseconds)
 }
 
 /*
- * A4988 드라이버를 활성화한다.
+ * A4988 드라이버 활성화
  *
- * ENABLE 핀은 Active Low이므로 LOW를 출력한다.
+ * ENABLE은 Active Low이다.
  */
 void StepperMotor::enable()
 {
-    if (enableLine_ != nullptr)
+    /*
+     * ENABLE 핀을 사용하지 않는 경우에는 아무 작업도 하지 않는다.
+     */
+    if (!initialized_ ||
+        request_ == nullptr ||
+        enablePin_ < 0)
     {
-        gpiod_line_set_value(enableLine_, 0);
+        return;
+    }
+
+    if (gpiod_line_request_set_value(
+            request_,
+            static_cast<unsigned int>(enablePin_),
+            GPIOD_LINE_VALUE_INACTIVE) < 0)
+    {
+        std::cerr
+            << "ENABLE LOW 출력 실패: "
+            << std::strerror(errno)
+            << '\n';
     }
 }
 
 /*
- * A4988 드라이버를 비활성화한다.
+ * A4988 드라이버 비활성화
  *
- * ENABLE 핀에 HIGH를 출력하면 모터 전류가 차단되며,
- * 발열과 소비 전력을 줄일 수 있다.
+ * ENABLE HIGH를 출력하면 모터 코일 전류가 차단된다.
  */
 void StepperMotor::disable()
 {
-    if (enableLine_ != nullptr)
+    if (!initialized_ ||
+        request_ == nullptr ||
+        enablePin_ < 0)
     {
-        gpiod_line_set_value(enableLine_, 1);
+        return;
+    }
+
+    if (gpiod_line_request_set_value(
+            request_,
+            static_cast<unsigned int>(enablePin_),
+            GPIOD_LINE_VALUE_ACTIVE) < 0)
+    {
+        std::cerr
+            << "ENABLE HIGH 출력 실패: "
+            << std::strerror(errno)
+            << '\n';
     }
 }
 
 /*
- * 프로그램 내부에서 누적 계산한 현재 Step 위치를 반환한다.
+ * 현재 논리적 Step 위치 반환
  */
 long StepperMotor::getCurrentPosition() const
 {
@@ -300,9 +473,7 @@ long StepperMotor::getCurrentPosition() const
 }
 
 /*
- * 현재 논리적 위치값을 지정한 값으로 변경한다.
- *
- * 원점 설정이나 중심 위치 보정 시 사용한다.
+ * 논리적 현재 위치 강제 지정
  */
 void StepperMotor::setCurrentPosition(long position)
 {
@@ -310,7 +481,7 @@ void StepperMotor::setCurrentPosition(long position)
 }
 
 /*
- * GPIO 초기화 완료 여부를 반환한다.
+ * GPIO 초기화 상태 반환
  */
 bool StepperMotor::isInitialized() const
 {
@@ -318,40 +489,29 @@ bool StepperMotor::isInitialized() const
 }
 
 /*
- * 점유하고 있던 GPIO Line과 GPIO 칩을 안전하게 해제한다.
- *
- * 초기화 중 오류가 발생하거나 객체가 소멸될 때 호출된다.
+ * GPIO 요청 및 GPIO 칩 자원 해제
  */
 void StepperMotor::releaseGPIO()
 {
     initialized_ = false;
 
     /*
-     * GPIO 칩을 닫기 전에 개별 GPIO Line을 먼저 해제한다.
-     * ENABLE, DIR, STEP 순서는 기능상 큰 차이는 없지만,
-     * 초기화 과정의 역순으로 정리한다.
+     * GPIO line request를 먼저 해제한다.
      */
-    if (enableLine_ != nullptr)
+    if (request_ != nullptr)
     {
-        gpiod_line_release(enableLine_);
-        enableLine_ = nullptr;
+        gpiod_line_request_release(request_);
+        request_ = nullptr;
     }
 
-    if (dirLine_ != nullptr)
-    {
-        gpiod_line_release(dirLine_);
-        dirLine_ = nullptr;
-    }
-
-    if (stepLine_ != nullptr)
-    {
-        gpiod_line_release(stepLine_);
-        stepLine_ = nullptr;
-    }
-
+    /*
+     * GPIO 칩을 닫는다.
+     */
     if (chip_ != nullptr)
     {
         gpiod_chip_close(chip_);
         chip_ = nullptr;
     }
+
+    offsetCount_ = 0;
 }
