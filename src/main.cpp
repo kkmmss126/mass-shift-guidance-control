@@ -3,6 +3,7 @@
 #include <thread>     // sleep_for 사용
 #include <chrono>     // 시간 제어(ms) 사용
 #include <string>     // string 자료형 사용
+#include <atomic>     // std::atomic을 이용한 스레드 간 안전한 변수 공유
 
 /*
  * 실제 하드웨어 측정을 통해 확보한
@@ -149,40 +150,43 @@ private:
      */
     SystemState m_currentState = SystemState::INITIALIZING;
 
-// ========================================================
-// 실제 Hardware Driver
-// ========================================================
-/*
- * Phase 1 ~ Phase 4에서 공통으로 사용하기 때문에
- * 각 Phase 내부에서 객체를 새로 생성하지 않고
- * Controller가 하드웨어 객체를 소유하도록 한다.
- *
- * 이렇게 하면
- *
- * 초기화
- *   ↓
- * 중간유도
- *   ↓
- * 종말유도
- *   ↓
- * 동체제어
- *
- * 전체 과정에서 동일한 하드웨어 상태를 유지할 수 있다.
- */
+    /*
+    * 사용자 안전 종료 요청 플래그
+    */
+    std::atomic<bool> m_exitRequested{false};
 
-PCA9685 m_pca9685;
-MPU6050 m_imu;
+    // ========================================================
+    // 실제 Hardware Driver
+    // ========================================================
+    /*
+    * Phase 1 ~ Phase 4에서 공통으로 사용하기 때문에
+     * 각 Phase 내부에서 객체를 새로 생성하지 않고
+    * Controller가 하드웨어 객체를 소유하도록 한다.
+    *
+    * 이렇게 하면
+    *
+    * 초기화
+    *   ↓
+    * 중간유도
+    *   ↓
+    * 종말유도
+    *   ↓
+    * 동체제어
+    *
+    * 전체 과정에서 동일한 하드웨어 상태를 유지할 수 있다.
+    */
+    PCA9685 m_pca9685;
+    MPU6050 m_imu;
 
-StepperMotor m_stepperX;
-StepperMotor m_stepperY;
-
-/*
- * StepperMotor의 경우 실제 작성한 라이브러리의
- * 생성자 형태에 맞춰 X/Y 두 객체를 생성한다.
- *
- * 정확한 생성자 형태는 StepperMotor.h 확인 후
- * 바로 확정한다.
- */
+    /*
+    * StepperMotor의 경우 실제 작성한 라이브러리의
+    * 생성자 형태에 맞춰 X/Y 두 객체를 생성한다.
+    *
+    * 정확한 생성자 형태는 StepperMotor.h 확인 후
+    * 바로 확정한다.
+    */
+    StepperMotor m_stepperX;
+    StepperMotor m_stepperY;
 
     // ========================================================
     // 동체 상태 변수
@@ -280,6 +284,55 @@ public:
       )
     {
     }
+
+    /*
+    * 사용자 입력 감시
+    *
+    * 별도 스레드에서 키보드 입력을 기다린다.
+    * q 또는 Q가 입력되면 안전 종료 요청 플래그를 설정한다.
+    *
+    * 이 함수는 제어 루프와 독립적으로 실행되므로
+    * 센서/구동기 제어 루프를 정지시키지 않는다.
+    */
+    void monitorExitInput()
+    {
+        char input;
+
+        while (!m_exitRequested)
+        {
+            std::cin >> input;
+
+            if (input == 'q' || input == 'Q')
+            {
+                std::cout
+                    << "\n[SAFE EXIT] 종료 요청이 입력되었습니다.\n";
+
+                m_exitRequested = true;
+
+                break;
+            }
+        }
+    }
+
+    /*
+    * 안전 종료 요청 확인
+    *
+    * 종료 요청이 들어온 경우 시스템 상태를
+    * MISSION_COMPLETE로 변경한다.
+    */
+    bool checkExitRequest()
+    {
+        if (m_exitRequested)
+        {
+            m_currentState =
+                SystemState::MISSION_COMPLETE;
+
+            return true;
+        }
+
+        return false;
+    }
+
     // ========================================================
     // Servo PWM 출력 인터페이스
     // ========================================================
@@ -296,7 +349,6 @@ public:
      * 서보 제어에서는 일반적으로 ON count를 0으로 두고
      * OFF count에 목표 PWM 값을 전달한다.
      */
-
     void writeServoPWM(
         const std::string& motorName,
         int pwmValue)
@@ -497,13 +549,29 @@ public:
     void runSystem()
     {
         std::cout
-            << "==================================================\n"
-            << "      Mass Shift Guidance Control System\n"
-            << "==================================================\n";
+        << "==================================================\n"
+        << "      Mass Shift Guidance Control System\n"
+        << "==================================================\n"
+        << " q 입력 시 안전 종료\n"
+        << "==================================================\n";
 
+
+    /*
+     * 사용자 종료 입력 감시 스레드
+     */
+    std::thread inputThread(
+        &IntegratedMissileController::monitorExitInput,this
+    );
+
+    inputThread.detach();
 
         while (m_currentState != SystemState::MISSION_COMPLETE)
         {
+             if (checkExitRequest())
+            {
+                break;
+            }
+
             switch (m_currentState)
             {
                 case SystemState::INITIALIZING:
@@ -552,10 +620,21 @@ public:
             );
         }
         
+        /*
+         * StepperMotor가 정상적으로 초기화된 경우에만
+         * 액추에이터 원위치 복귀를 수행한다.
+         */
+        if (
+            m_stepperX.isInitialized() &&
+            m_stepperY.isInitialized()
+        )
+        {
         // 전체 Phase 종료 후 액추에이터 원위치 복귀
         returnLinearActuatorToStart();
+
         m_stepperX.disable();
         m_stepperY.disable();
+        }
 
         std::cout
             << "\n==================================================\n"
@@ -776,6 +855,15 @@ private:
             m_currentBodyY < targetY
         )
         {
+            /*
+             * 사용자 안전 종료 요청 확인
+             */
+            if (checkExitRequest())
+            {
+                break;
+            }
+
+
             if (m_currentBodyX < targetX)
             {
                 m_currentBodyX +=
@@ -823,7 +911,11 @@ private:
                 )
             );
         }
-
+        
+        if (checkExitRequest())
+        {
+            return;
+        }
 
         std::cout
             << " -> 목표 사분면 도달\n"
@@ -862,7 +954,7 @@ private:
             ControlConstants::LOOP_TIME_MS / 1000.0;
 
 
-        while (true)
+        while(true)
         {
             // ------------------------------------------------
             // 현재는 알고리즘 검증용 Mock 목표값 사용
@@ -871,6 +963,12 @@ private:
              * 추후 이 부분은 3개의 초음파 센서 거리값을
              * 입력으로 받는 타겟 방향 계산 함수로 교체한다.
              */
+
+            //사용자 안전 종료 요청 확인
+            if (checkExitRequest())
+            {
+                break;
+            }
 
             double seekerErrorX =
                 m_mockTargetX -
@@ -996,7 +1094,6 @@ private:
                 m_stableLockCount = 0;
             }
 
-
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(
                     static_cast<long long>(
@@ -1006,11 +1103,14 @@ private:
             );
         }
 
+        if (checkExitRequest())
+        {
+            return;
+        }
 
-        m_currentState =
-            SystemState::BODY_TRACKING;
+        m_currentState = SystemState::BODY_TRACKING;
+
     }
-
 
     // ========================================================
     // Phase 4
@@ -1038,8 +1138,16 @@ private:
         const double bodyKpY = 0.20;
 
 
-        while (true)
+        while(true)
         {
+            /*
+             * 사용자 안전 종료 요청 확인
+             */
+            if (checkExitRequest())
+            {
+                break;
+            }
+
             /*
              * 시커 중심축과 동체 사이의 방향 오차
              */
@@ -1130,9 +1238,12 @@ private:
             );
         }
 
+        if (checkExitRequest())
+        {
+            return;
+        }
 
-        m_currentState =
-            SystemState::MISSION_COMPLETE;
+        m_currentState =  SystemState::MISSION_COMPLETE;
     }
 };
 
