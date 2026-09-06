@@ -77,8 +77,8 @@ constexpr int SERVO_BOTTOM_CHANNEL = 1;
  * 기존 캘리브레이션에서 측정한 중심값.
  */
 
-constexpr int SERVO_TOP_CENTER_PWM = 460;
-constexpr int SERVO_BOTTOM_CENTER_PWM = 360;
+constexpr int SERVO_TOP_CENTER_PWM = 321;
+constexpr int SERVO_BOTTOM_CENTER_PWM = 300;
 
 
 /*
@@ -90,11 +90,11 @@ constexpr int SERVO_BOTTOM_CENTER_PWM = 360;
  * 실제 기구물의 최대 회전 범위를 확인한 후 수정한다.
  */
 
-constexpr int TOP_PWM_MIN = 360;
-constexpr int TOP_PWM_MAX = 560;
+constexpr int TOP_PWM_MIN = 0;
+constexpr int TOP_PWM_MAX = 500;
 
-constexpr int BOTTOM_PWM_MIN = 260;
-constexpr int BOTTOM_PWM_MAX = 460;
+constexpr int BOTTOM_PWM_MIN = 0;
+constexpr int BOTTOM_PWM_MAX = 500;
 
 
 /*
@@ -108,8 +108,8 @@ constexpr int BOTTOM_PWM_MAX = 460;
  * 진동하거나 표적을 지나치면 감소시킨다.
  */
 
-constexpr double KP_YAW = 1.0;
-constexpr double KP_PITCH = 1.0;
+constexpr double KP_YAW = 3.0;
+constexpr double KP_PITCH = 3.0;
 
 
 /*
@@ -136,7 +136,7 @@ constexpr double PITCH_DEADZONE_CM = 0.5;
  */
 
 constexpr double MIN_DISTANCE_CM = 2.0;
-constexpr double MAX_DISTANCE_CM = 100.0;
+constexpr double MAX_DISTANCE_CM = 30.0;
 
 
 /*
@@ -153,7 +153,7 @@ constexpr double MAX_DISTANCE_CM = 100.0;
  * 10 → 15 → 20ms 순으로 증가시키면서 확인한다.
  */
 
-constexpr int SENSOR_INTERVAL_MS = 10;
+constexpr int SENSOR_INTERVAL_MS = 15;
 
 
 /*
@@ -197,7 +197,7 @@ constexpr int MAX_SENSOR_FAILURE_COUNT = 2;
  * 47.2cm를 제어에 사용하지 않는다.
  */
 
-constexpr double MAX_DISTANCE_JUMP_CM = 8.0;
+constexpr double MAX_DISTANCE_JUMP_CM = 1000.0;
 
 
 /*
