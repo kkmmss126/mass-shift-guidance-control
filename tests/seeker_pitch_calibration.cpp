@@ -2,9 +2,8 @@
 
 #include <gpiod.h>
 
-#include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 
@@ -15,29 +14,30 @@
  *
  * Description
  * ------------------------------------------------------------
- * 좌/우/하단 초음파 센서를 이용하여
- * 시커의 상하(Pitch) 방향만 독립적으로 추적한다.
+ * Pitch 중심 오프셋 측정 전용 프로그램.
  *
- * Yaw 서보:
- *     중심 PWM에 고정
+ * 1. Yaw 서보를 PWM 300에 고정한다.
+ * 2. Pitch 서보를 PWM 321에 고정한다.
+ * 3. 좌/우/하단 초음파 센서를 순차적으로 측정한다.
+ * 4. 표적을 시커 정중앙에 고정한다.
+ * 5. 정상 측정값 30개를 수집한다.
  *
- * Pitch 서보:
- *     상단 두 센서 평균값과 하단 센서값의 차이를 이용해
- *     고정 PWM Step 방식으로 추적한다.
+ * Pitch Raw Error:
  *
- * P 제어는 사용하지 않는다.
+ *      ((Left + Right) / 2) - Bottom
  *
- * Pitch Calibration Result
+ * 이 값의 평균을 Pitch 중심 오프셋으로 사용한다.
+ *
+ * 중요:
  * ------------------------------------------------------------
+ * 이 프로그램에서는 추적 제어를 하지 않는다.
  *
- * 중앙 정지 상태에서:
+ * 따라서 측정 중:
  *
- * ((Left + Right) / 2) - Bottom
+ * Yaw  = PWM 300 고정
+ * Pitch = PWM 321 고정
  *
- * 평균값 ≈ +0.807 cm
- *
- * 따라서 제어 오차 계산 시
- * +0.807 cm의 중심 오프셋을 제거한다.
+ * 센서부는 움직이지 않는다.
  * ============================================================
  */
 
@@ -63,7 +63,7 @@ constexpr unsigned int BOTTOM_ECHO_PIN = 6;
 
 /*
  * ============================================================
- * PCA9685 Servo Channel
+ * PCA9685 / Servo 설정
  * ============================================================
  *
  * Channel 0 = Pitch
@@ -75,9 +75,7 @@ constexpr int YAW_SERVO_CHANNEL   = 1;
 
 
 /*
- * ============================================================
- * Servo Center PWM
- * ============================================================
+ * 기존에 찾은 서보 중심 PWM
  */
 
 constexpr int PITCH_CENTER_PWM = 321;
@@ -86,76 +84,7 @@ constexpr int YAW_CENTER_PWM   = 300;
 
 /*
  * ============================================================
- * Pitch Servo 안전 범위
- * ============================================================
- */
-
-constexpr int PITCH_PWM_MIN = 200;
-constexpr int PITCH_PWM_MAX = 450;
-
-
-/*
- * ============================================================
- * Pitch Center Offset
- * ============================================================
- *
- * 중앙 정지 상태에서 30회 측정한 결과:
- *
- * Average Pitch Error ≈ +0.807 cm
- *
- * 따라서:
- *
- * 실제 제어 오차 =
- *
- * ((L + R) / 2 - B)
- * - PITCH_CENTER_OFFSET_CM
- */
-
-constexpr double PITCH_CENTER_OFFSET_CM = 0.807;
-
-
-/*
- * ============================================================
- * Pitch Dead Zone
- * ============================================================
- *
- * 오프셋 보정 후 ±1cm 이내라면
- * 표적이 중앙에 있다고 판단한다.
- */
-
-constexpr double PITCH_DEADZONE_CM = 1.0;
-
-
-/*
- * ============================================================
- * Pitch PWM Step
- * ============================================================
- *
- * Dead Zone을 벗어나면
- * 한 제어 주기마다 3 PWM씩 이동한다.
- */
-
-constexpr int PITCH_PWM_STEP = 3;
-
-
-/*
- * ============================================================
- * Pitch Servo Direction
- * ============================================================
- *
- * 현재 실제 움직임 방향이 맞았으므로 1 유지.
- *
- * 만약 반대로 움직이면:
- *
- * 1 -> -1
- */
-
-constexpr int PITCH_DIRECTION = 1;
-
-
-/*
- * ============================================================
- * 초음파 측정 범위
+ * 초음파 센서 설정
  * ============================================================
  */
 
@@ -164,19 +93,31 @@ constexpr double MAX_DISTANCE_CM = 40.0;
 
 
 /*
- * ============================================================
- * 센서 간 측정 간격
- * ============================================================
+ * 각 센서 측정 사이의 대기시간
+ *
+ * LEFT
+ *  ↓ 15ms
+ * RIGHT
+ *  ↓ 15ms
+ * BOTTOM
  */
 
 constexpr int SENSOR_INTERVAL_MS = 15;
 
 
 /*
- * 한 번의 제어 이후 추가 대기시간
+ * 한 세트 측정 완료 후
+ * 다음 측정까지 대기시간
  */
 
-constexpr int CONTROL_PERIOD_MS = 50;
+constexpr int SAMPLE_PERIOD_MS = 50;
+
+
+/*
+ * 정상 측정값 수
+ */
+
+constexpr int TARGET_SAMPLE_COUNT = 30;
 
 
 /*
@@ -350,7 +291,7 @@ public:
      * 정상:
      *     거리(cm)
      *
-     * 실패 또는 측정 범위 밖:
+     * 실패 / 범위 밖:
      *     -1.0
      */
 
@@ -435,7 +376,7 @@ public:
 
 
         /*
-         * ECHO HIGH 시작 시간
+         * ECHO HIGH 시작 시각
          */
 
         auto echoStart =
@@ -476,7 +417,7 @@ public:
 
 
         /*
-         * Echo Pulse Width 계산
+         * ECHO Pulse Width 계산
          */
 
         double pulseTimeUs =
@@ -494,7 +435,7 @@ public:
 
 
         /*
-         * 유효 측정 범위 검사
+         * 유효 측정 범위 확인
          */
 
         if (distanceCm < MIN_DISTANCE_CM ||
@@ -531,9 +472,8 @@ int main()
 {
     std::cout
         << "========================================\n"
-        << "    Seeker Pitch Tracking Test\n"
-        << "    Center Offset Applied\n"
-        << "========================================\n";
+        << "   Seeker Pitch Center Calibration\n"
+        << "========================================\n\n";
 
 
     /*
@@ -559,7 +499,48 @@ int main()
 
     /*
      * ========================================================
-     * 센서 생성
+     * 서보 완전 고정
+     * ========================================================
+     *
+     * Calibration 동안에는
+     * 이 PWM 값을 변경하지 않는다.
+     */
+
+    pwm.setPWM(
+        PITCH_SERVO_CHANNEL,
+        0,
+        PITCH_CENTER_PWM);
+
+
+    pwm.setPWM(
+        YAW_SERVO_CHANNEL,
+        0,
+        YAW_CENTER_PWM);
+
+
+    std::cout
+        << "[INIT] Pitch servo fixed at PWM "
+        << PITCH_CENTER_PWM
+        << '\n';
+
+
+    std::cout
+        << "[INIT] Yaw servo fixed at PWM "
+        << YAW_CENTER_PWM
+        << '\n';
+
+
+    /*
+     * 서보가 중심까지 이동할 시간을 준다.
+     */
+
+    std::this_thread::sleep_for(
+        std::chrono::seconds(1));
+
+
+    /*
+     * ========================================================
+     * 초음파 센서 생성
      * ========================================================
      */
 
@@ -578,121 +559,84 @@ int main()
         BOTTOM_ECHO_PIN);
 
 
-    /*
-     * ========================================================
-     * Servo 초기 위치
-     * ========================================================
-     */
-
-    int pitchPWM =
-        PITCH_CENTER_PWM;
-
-
-    /*
-     * Yaw는 중심에 고정한다.
-     */
-
-    pwm.setPWM(
-        YAW_SERVO_CHANNEL,
-        0,
-        YAW_CENTER_PWM);
-
-
-    /*
-     * Pitch도 중심에서 시작한다.
-     */
-
-    pwm.setPWM(
-        PITCH_SERVO_CHANNEL,
-        0,
-        pitchPWM);
-
-
     std::cout
-        << "[INIT] Yaw fixed   : "
-        << YAW_CENTER_PWM
-        << '\n';
+        << "\n표적을 시커 정중앙에 고정하세요.\n"
 
+        << "Pitch/Yaw 서보는 측정 중 움직이지 않습니다.\n"
 
-    std::cout
-        << "[INIT] Pitch PWM   : "
-        << pitchPWM
-        << '\n';
-
-
-    std::cout
-        << "[INIT] Pitch Offset: "
-        << PITCH_CENTER_OFFSET_CM
-        << " cm\n";
-
-
-    std::cout
-        << "[INIT] Dead Zone   : +/-"
-        << PITCH_DEADZONE_CM
-        << " cm\n";
-
-
-    std::cout
-        << "[INIT] PWM Step    : "
-        << PITCH_PWM_STEP
-        << '\n';
-
-
-    /*
-     * 서보가 초기 위치까지 이동할 시간
-     */
-
-    std::this_thread::sleep_for(
-        std::chrono::seconds(1));
-
-
-    std::cout
-        << "\nPitch Tracking Start\n"
-        << "Ctrl+C : 종료\n\n";
+        << "정상 측정값 "
+        << TARGET_SAMPLE_COUNT
+        << "개를 자동으로 수집합니다.\n\n";
 
 
     /*
      * ========================================================
-     * Tracking Loop
+     * 평균 계산 변수
      * ========================================================
      */
 
-    while (true)
+    int validSampleCount = 0;
+
+    int failedSampleCount = 0;
+
+
+    double leftSum = 0.0;
+
+    double rightSum = 0.0;
+
+    double bottomSum = 0.0;
+
+    double upperAverageSum = 0.0;
+
+    double pitchErrorSum = 0.0;
+
+
+    /*
+     * ========================================================
+     * Calibration Loop
+     * ========================================================
+     */
+
+    while (
+        validSampleCount <
+        TARGET_SAMPLE_COUNT)
     {
         /*
-         * ====================================================
          * LEFT 측정
-         * ====================================================
          */
 
         double leftDistance =
             leftSensor.measureDistance();
 
 
+        /*
+         * 센서 간 간섭 방지
+         */
+
         std::this_thread::sleep_for(
             std::chrono::milliseconds(
                 SENSOR_INTERVAL_MS));
 
 
         /*
-         * ====================================================
          * RIGHT 측정
-         * ====================================================
          */
 
         double rightDistance =
             rightSensor.measureDistance();
 
 
+        /*
+         * 센서 간 간섭 방지
+         */
+
         std::this_thread::sleep_for(
             std::chrono::milliseconds(
                 SENSOR_INTERVAL_MS));
 
 
         /*
-         * ====================================================
          * BOTTOM 측정
-         * ====================================================
          */
 
         double bottomDistance =
@@ -701,198 +645,225 @@ int main()
 
         /*
          * ====================================================
-         * 세 센서 모두 유효한 경우에만 제어
-         * ====================================================
-         */
-
-        if (leftDistance >= 0.0 &&
-            rightDistance >= 0.0 &&
-            bottomDistance >= 0.0)
-        {
-            /*
-             * 상단 두 센서의 평균 거리
-             */
-
-            double upperAverage =
-                (leftDistance +
-                 rightDistance)
-                / 2.0;
-
-
-            /*
-             * =================================================
-             * Offset 보정 전 Pitch Error
-             * =================================================
-             */
-
-            double rawPitchError =
-                upperAverage -
-                bottomDistance;
-
-
-            /*
-             * =================================================
-             * Offset 보정 후 실제 제어 Error
-             * =================================================
-             *
-             * 중앙 상태에서 약 +0.807cm가 측정되므로
-             * 해당 값을 제거한다.
-             */
-
-            double pitchError =
-                rawPitchError -
-                PITCH_CENTER_OFFSET_CM;
-
-
-            /*
-             * =================================================
-             * Dead Zone
-             * =================================================
-             */
-
-            if (std::abs(pitchError) <=
-                PITCH_DEADZONE_CM)
-            {
-                /*
-                 * 중앙으로 판단.
-                 *
-                 * PWM을 변경하지 않고 현재 위치 유지.
-                 */
-
-                std::cout
-                    << "[CENTER] ";
-            }
-
-
-            /*
-             * =================================================
-             * Pitch 한 방향 추적
-             * =================================================
-             */
-
-            else if (pitchError > 0.0)
-            {
-                pitchPWM +=
-                    PITCH_PWM_STEP *
-                    PITCH_DIRECTION;
-
-
-                std::cout
-                    << "[TRACK A] ";
-            }
-
-
-            /*
-             * =================================================
-             * Pitch 반대 방향 추적
-             * =================================================
-             */
-
-            else
-            {
-                pitchPWM -=
-                    PITCH_PWM_STEP *
-                    PITCH_DIRECTION;
-
-
-                std::cout
-                    << "[TRACK B] ";
-            }
-
-
-            /*
-             * =================================================
-             * Servo 안전 범위 제한
-             * =================================================
-             */
-
-            pitchPWM =
-                std::clamp(
-                    pitchPWM,
-                    PITCH_PWM_MIN,
-                    PITCH_PWM_MAX);
-
-
-            /*
-             * Pitch Servo 적용
-             */
-
-            pwm.setPWM(
-                PITCH_SERVO_CHANNEL,
-                0,
-                pitchPWM);
-
-
-            /*
-             * =================================================
-             * Debug 출력
-             * =================================================
-             */
-
-            std::cout
-                << "L="
-                << leftDistance
-
-                << " R="
-                << rightDistance
-
-                << " B="
-                << bottomDistance
-
-                << " UpperAvg="
-                << upperAverage
-
-                << " RawErr="
-                << rawPitchError
-
-                << " Err="
-                << pitchError
-
-                << " PWM="
-                << pitchPWM
-
-                << '\n';
-        }
-
-
-        /*
-         * ====================================================
-         * 센서 하나라도 측정 범위 밖 / 실패
+         * 유효성 검사
          * ====================================================
          *
-         * 현재 위치 유지.
+         * 세 센서 중 하나라도 실패하면
+         * 해당 샘플은 평균 계산에서 제외한다.
          */
 
-        else
+        if (leftDistance < 0.0 ||
+            rightDistance < 0.0 ||
+            bottomDistance < 0.0)
         {
+            failedSampleCount++;
+
+
             std::cout
-                << "[SENSOR INVALID - HOLD]"
-
-                << " L="
-                << leftDistance
-
-                << " R="
-                << rightDistance
-
-                << " B="
-                << bottomDistance
-
-                << " PWM="
-                << pitchPWM
-
+                << "[INVALID]"
+                << " L=" << leftDistance
+                << " R=" << rightDistance
+                << " B=" << bottomDistance
+                << " Failed="
+                << failedSampleCount
                 << '\n';
+
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(
+                    SAMPLE_PERIOD_MS));
+
+
+            continue;
         }
 
 
         /*
-         * 다음 제어 루프까지 대기
+         * ====================================================
+         * 상단 센서 평균
+         * ====================================================
+         */
+
+        double upperAverage =
+            (leftDistance +
+             rightDistance)
+            / 2.0;
+
+
+        /*
+         * ====================================================
+         * Pitch Raw Error
+         * ====================================================
+         *
+         * 추적 코드에서 사용하는 것과 동일한 식:
+         *
+         * ((L + R) / 2) - B
+         */
+
+        double pitchError =
+            upperAverage -
+            bottomDistance;
+
+
+        /*
+         * ====================================================
+         * 평균 계산용 누적
+         * ====================================================
+         */
+
+        leftSum +=
+            leftDistance;
+
+
+        rightSum +=
+            rightDistance;
+
+
+        bottomSum +=
+            bottomDistance;
+
+
+        upperAverageSum +=
+            upperAverage;
+
+
+        pitchErrorSum +=
+            pitchError;
+
+
+        validSampleCount++;
+
+
+        /*
+         * ====================================================
+         * 현재 측정값 출력
+         * ====================================================
+         */
+
+        std::cout
+            << std::fixed
+            << std::setprecision(3)
+
+            << "["
+            << validSampleCount
+            << "/"
+            << TARGET_SAMPLE_COUNT
+            << "] "
+
+            << "L="
+            << leftDistance
+
+            << "  R="
+            << rightDistance
+
+            << "  B="
+            << bottomDistance
+
+            << "  UpperAvg="
+            << upperAverage
+
+            << "  PitchErr="
+            << pitchError
+
+            << '\n';
+
+
+        /*
+         * 다음 측정까지 대기
          */
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(
-                CONTROL_PERIOD_MS));
+                SAMPLE_PERIOD_MS));
     }
 
+
+    /*
+     * ========================================================
+     * 평균 계산
+     * ========================================================
+     */
+
+    double averageLeft =
+        leftSum /
+        validSampleCount;
+
+
+    double averageRight =
+        rightSum /
+        validSampleCount;
+
+
+    double averageBottom =
+        bottomSum /
+        validSampleCount;
+
+
+    double averageUpper =
+        upperAverageSum /
+        validSampleCount;
+
+
+    double averagePitchOffset =
+        pitchErrorSum /
+        validSampleCount;
+
+
+    /*
+     * ========================================================
+     * 최종 Calibration 결과
+     * ========================================================
+     */
+
+    std::cout
+        << "\n========================================\n"
+        << "       Pitch Calibration Result\n"
+        << "========================================\n"
+
+        << std::fixed
+        << std::setprecision(3)
+
+        << "Valid samples     : "
+        << validSampleCount
+        << '\n'
+
+        << "Failed samples    : "
+        << failedSampleCount
+        << '\n'
+
+        << "Average Left      : "
+        << averageLeft
+        << " cm\n"
+
+        << "Average Right     : "
+        << averageRight
+        << " cm\n"
+
+        << "Average Bottom    : "
+        << averageBottom
+        << " cm\n"
+
+        << "Average Upper     : "
+        << averageUpper
+        << " cm\n"
+
+        << "Average Pitch Err : "
+        << averagePitchOffset
+        << " cm\n\n"
+
+        << "Recommended code:\n\n"
+
+        << "constexpr double PITCH_CENTER_OFFSET_CM = "
+        << averagePitchOffset
+        << ";\n"
+
+        << "========================================\n";
+
+
+    /*
+     * 프로그램 종료 시점까지
+     * Pitch/Yaw는 중심 PWM을 유지한다.
+     */
 
     return 0;
 }

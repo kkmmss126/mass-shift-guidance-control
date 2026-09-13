@@ -153,7 +153,7 @@ constexpr double MAX_DISTANCE_CM = 30.0;
  * 10 → 15 → 20ms 순으로 증가시키면서 확인한다.
  */
 
-constexpr int SENSOR_INTERVAL_MS = 15;
+constexpr int SENSOR_INTERVAL_MS = 30;
 
 
 /*
