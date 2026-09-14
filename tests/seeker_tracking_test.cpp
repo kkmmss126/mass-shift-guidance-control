@@ -1,28 +1,3 @@
-/*
- * ============================================================
- * File Name : seeker_tracking_test.cpp
- *
- * Description
- * ------------------------------------------------------------
- * 삼중 초음파 센서와 2축 서보모터를 이용한
- * 시커부 독립 표적 추적 테스트 프로그램.
- *
- * 개선 사항
- * ------------------------------------------------------------
- * 1. 초음파 센서 순간 측정 실패 허용
- * 2. 이전 정상 측정값 유지
- * 3. 급격한 이상값(Jump) 제거
- * 4. EMA 필터 적용
- * 5. 최소 PWM 이동량 보장
- * 6. 한 루프 최대 PWM 이동량 제한
- * 7. 제어 주기 단축
- *
- * Project
- * ------------------------------------------------------------
- * Mass Shift Guidance Control System
- * ============================================================
- */
-
 #include "PCA9685.h"
 
 #include <gpiod.h>
@@ -34,27 +9,63 @@
 #include <thread>
 
 
-/*
+/* seeker_tracking v1
  * ============================================================
- * GPIO 설정
+ * File Name : seeker_tracking_test.cpp
+ *
+ * Yaw + Pitch Integrated Seeker Tracking Test
  * ============================================================
  *
- * 회로도 기준 BCM GPIO 번호
+ * YAW
+ * ------------------------------------------------------------
+ * LEFT / RIGHT 센서 사용
  *
- * U9  : 좌측 초음파 센서
- * U10 : 우측 초음파 센서
- * U11 : 하단 초음파 센서
+ * LEFT  = GPIO 12 / 13
+ * RIGHT = GPIO 5  / 20
+ *
+ * 두 센서 거리차로 좌우 추적
+ *
+ * Dead Zone = 2.5 cm
+ * PWM Step  = 4
+ *
+ *
+ * PITCH
+ * ------------------------------------------------------------
+ * LEFT / BOTTOM 센서 사용
+ *
+ * Pitch Error = LEFT - BOTTOM
+ *
+ * Dead Zone = 1.0 cm
+ * PWM Step  = 3
+ *
+ *
+ * 공통
+ * ------------------------------------------------------------
+ * P 제어 사용 X
+ * 고정 PWM Step 방식
+ * Target Lost 시 중심 복귀 X
+ * 현재 위치 HOLD
+ * ============================================================
  */
 
-// U9 - Left
-constexpr unsigned int LEFT_TRIG_PIN = 5;
-constexpr unsigned int LEFT_ECHO_PIN = 20;
 
-// U10 - Right
-constexpr unsigned int RIGHT_TRIG_PIN = 12;
-constexpr unsigned int RIGHT_ECHO_PIN = 13;
+/*
+ * ============================================================
+ * GPIO
+ * ============================================================
+ *
+ * Yaw 단독 시험에서 실제 사용한 센서 정의를 기준으로 한다.
+ */
 
-// U11 - Bottom
+// LEFT
+constexpr unsigned int LEFT_TRIG_PIN = 12;
+constexpr unsigned int LEFT_ECHO_PIN = 13;
+
+// RIGHT
+constexpr unsigned int RIGHT_TRIG_PIN = 5;
+constexpr unsigned int RIGHT_ECHO_PIN = 20;
+
+// BOTTOM
 constexpr unsigned int BOTTOM_TRIG_PIN = 16;
 constexpr unsigned int BOTTOM_ECHO_PIN = 6;
 
@@ -65,207 +76,107 @@ constexpr unsigned int BOTTOM_ECHO_PIN = 6;
  * ============================================================
  */
 
-constexpr int SERVO_TOP_CHANNEL = 0;
-constexpr int SERVO_BOTTOM_CHANNEL = 1;
+constexpr int PITCH_SERVO_CHANNEL = 0;
+constexpr int YAW_SERVO_CHANNEL   = 1;
 
 
 /*
  * ============================================================
  * Servo Center PWM
  * ============================================================
- *
- * 기존 캘리브레이션에서 측정한 중심값.
  */
 
-constexpr int SERVO_TOP_CENTER_PWM = 321;
-constexpr int SERVO_BOTTOM_CENTER_PWM = 300;
+constexpr int PITCH_CENTER_PWM = 321;
+constexpr int YAW_CENTER_PWM   = 300;
 
 
 /*
  * ============================================================
- * Servo PWM 안전 범위
+ * Servo PWM Limit
  * ============================================================
- *
- * 초기 테스트용 제한이다.
- * 실제 기구물의 최대 회전 범위를 확인한 후 수정한다.
  */
 
-constexpr int TOP_PWM_MIN = 0;
-constexpr int TOP_PWM_MAX = 500;
+constexpr int PITCH_PWM_MIN = 200;
+constexpr int PITCH_PWM_MAX = 450;
 
-constexpr int BOTTOM_PWM_MIN = 0;
-constexpr int BOTTOM_PWM_MAX = 500;
+constexpr int YAW_PWM_MIN = 200;
+constexpr int YAW_PWM_MAX = 400;
 
 
 /*
  * ============================================================
- * P 제어 Gain
- * ============================================================
- *
- * 일단 1.0으로 시작한다.
- *
- * 추적이 너무 느리면 조금씩 증가시키고,
- * 진동하거나 표적을 지나치면 감소시킨다.
- */
-
-constexpr double KP_YAW = 3.0;
-constexpr double KP_PITCH = 3.0;
-
-
-/*
- * ============================================================
- * Dead Zone
- * ============================================================
- *
- * 이 범위 안에서는 중심에 도달했다고 판단한다.
- */
-
-constexpr double YAW_DEADZONE_CM = 0.5;
-constexpr double PITCH_DEADZONE_CM = 0.5;
-
-
-/*
- * ============================================================
- * 초음파 센서 측정 범위
- * ============================================================
- *
- * 현재 실제 테스트 과정에서는 30cm 이상의 값도
- * 확인할 필요가 있으므로 100cm까지 허용한다.
- *
- * 최종 실험에서는 프로젝트 운용거리로 다시 제한할 수 있다.
- */
-
-constexpr double MIN_DISTANCE_CM = 2.0;
-constexpr double MAX_DISTANCE_CM = 30.0;
-
-
-/*
- * ============================================================
- * 센서 측정 간격
- * ============================================================
- *
- * 세 센서를 동시에 발사하면 초음파 간섭이 생길 수 있으므로
- * 순차 측정한다.
- *
- * 기존 15ms보다 조금 줄여 응답속도를 높인다.
- *
- * 만약 센서값이 다시 심하게 튄다면
- * 10 → 15 → 20ms 순으로 증가시키면서 확인한다.
- */
-
-constexpr int SENSOR_INTERVAL_MS = 30;
-
-
-/*
- * 한 번의 전체 측정 이후 추가 대기시간.
- *
- * 별도의 50ms 대기를 제거하여 추적 응답속도를 높인다.
- */
-
-constexpr int CONTROL_PERIOD_MS = 5;
-
-
-/*
- * ============================================================
- * 센서 오류 허용 횟수
- * ============================================================
- *
- * 센서가 한 번 측정 실패했다고 바로 TARGET LOST 처리하지 않는다.
- *
- * 최대 2회까지 이전 정상값을 사용하고,
- * 3회 연속 실패하면 해당 센서를 LOST 상태로 판단한다.
- */
-
-constexpr int MAX_SENSOR_FAILURE_COUNT = 2;
-
-
-/*
- * ============================================================
- * 센서 Jump 제한
- * ============================================================
- *
- * 직전 정상값과 비교하여 한 번에 지나치게 큰 거리 변화가
- * 발생하면 초음파 반사 노이즈로 판단한다.
- *
- * 예:
- *
- *  6.3 cm
- *  6.5 cm
- *  47.2 cm  <-- 이상값
- *  6.4 cm
- *
- * 47.2cm를 제어에 사용하지 않는다.
- */
-
-constexpr double MAX_DISTANCE_JUMP_CM = 1000.0;
-
-
-/*
- * ============================================================
- * EMA 필터 계수
- * ============================================================
- *
- * filtered =
- *     alpha * newValue
- *   + (1-alpha) * previousFiltered
- *
- * alpha가 클수록:
- *  - 빠르게 반응
- *  - 노이즈 증가
- *
- * alpha가 작을수록:
- *  - 부드러움
- *  - 반응 느림
- *
- * 시커 추적이 목적이므로 비교적 빠른 0.45 사용.
- */
-
-constexpr double EMA_ALPHA = 0.45;
-
-
-/*
- * ============================================================
- * PWM 제어 제한
+ * Yaw Control
  * ============================================================
  */
 
-/*
- * Dead Zone 밖인데 계산 결과가 0이면
- * 최소 이 값만큼 움직인다.
- */
-constexpr int MIN_PWM_STEP = 1;
+constexpr double YAW_DEADZONE_CM = 2.5;
 
-
-/*
- * 센서 노이즈 때문에 서보가 한 번에 크게 튀는 것을 방지한다.
- *
- * 한 제어 루프에서 PWM은 최대 ±4만 변화한다.
- */
-constexpr int MAX_PWM_STEP = 4;
-
-
-/*
- * ============================================================
- * Servo 방향
- * ============================================================
- *
- * 시커가 표적 반대 방향으로 움직이면
- * 해당 값을 1 ↔ -1로 변경한다.
- */
+constexpr int YAW_PWM_STEP = 4;
 
 constexpr int YAW_DIRECTION = 1;
+
+
+/*
+ * ============================================================
+ * Pitch Control
+ * ============================================================
+ *
+ * 실험적으로 비교적 잘 동작한
+ *
+ * LEFT - BOTTOM
+ *
+ * 방식 사용.
+ */
+
+constexpr double PITCH_DEADZONE_CM = 1.0;
+
+constexpr int PITCH_PWM_STEP = 3;
+
 constexpr int PITCH_DIRECTION = 1;
 
 
 /*
+ * Pitch Error가 지나치게 크면
+ * 센서 이상치로 판단하고 HOLD
+ */
+
+constexpr double PITCH_MAX_ERROR_CM = 15.0;
+
+
+/*
  * ============================================================
- * SRF05 Class
+ * Ultrasonic Sensor
+ * ============================================================
+ */
+
+constexpr double MIN_DISTANCE_CM = 20.0;
+constexpr double MAX_DISTANCE_CM = 40.0;
+
+
+/*
+ * 각 초음파 센서 사이 측정 간격
+ */
+
+constexpr int SENSOR_INTERVAL_MS = 15;
+
+
+/*
+ * 전체 제어 후 추가 대기
+ */
+
+constexpr int CONTROL_PERIOD_MS = 50;
+
+
+/*
+ * ============================================================
+ * SRF05
  * ============================================================
  */
 
 class SRF05
 {
 public:
+
     SRF05(
         unsigned int trigPin,
         unsigned int echoPin)
@@ -275,6 +186,7 @@ public:
         /*
          * GPIO Chip Open
          */
+
         m_chip =
             gpiod_chip_open(
                 "/dev/gpiochip0");
@@ -291,7 +203,7 @@ public:
 
         /*
          * ====================================================
-         * TRIG 핀 설정
+         * TRIG 설정
          * ====================================================
          */
 
@@ -336,7 +248,7 @@ public:
 
         /*
          * ====================================================
-         * ECHO 핀 설정
+         * ECHO 설정
          * ====================================================
          */
 
@@ -374,9 +286,6 @@ public:
             echoConfig);
 
 
-        /*
-         * GPIO Request 확인
-         */
         if (m_trigRequest == nullptr ||
             m_echoRequest == nullptr)
         {
@@ -419,14 +328,11 @@ public:
 
     /*
      * ========================================================
-     * measureDistance()
+     * 거리 측정
      * ========================================================
      *
-     * 정상 측정:
-     *     거리(cm)
-     *
-     * 측정 실패:
-     *     -1.0
+     * 정상 -> 거리(cm)
+     * 실패 -> -1
      */
 
     double measureDistance()
@@ -441,6 +347,7 @@ public:
         /*
          * TRIG LOW
          */
+
         gpiod_line_request_set_value(
             m_trigRequest,
             m_trigPin,
@@ -454,6 +361,7 @@ public:
         /*
          * TRIG HIGH 10us
          */
+
         gpiod_line_request_set_value(
             m_trigRequest,
             m_trigPin,
@@ -463,6 +371,10 @@ public:
         std::this_thread::sleep_for(
             std::chrono::microseconds(10));
 
+
+        /*
+         * TRIG LOW
+         */
 
         gpiod_line_request_set_value(
             m_trigRequest,
@@ -504,7 +416,7 @@ public:
 
 
         /*
-         * ECHO HIGH 시작 시각
+         * ECHO HIGH 시작
          */
 
         auto echoStart =
@@ -545,7 +457,7 @@ public:
 
 
         /*
-         * ECHO Pulse 시간 계산
+         * Pulse Width
          */
 
         double pulseTimeUs =
@@ -563,7 +475,7 @@ public:
 
 
         /*
-         * 유효 거리 검사
+         * 유효 범위
          */
 
         if (distanceCm < MIN_DISTANCE_CM ||
@@ -578,6 +490,7 @@ public:
 
 
 private:
+
     unsigned int m_trigPin;
     unsigned int m_echoPin;
 
@@ -590,272 +503,7 @@ private:
 
 /*
  * ============================================================
- * SensorFilter
- * ============================================================
- *
- * 각 초음파 센서의 측정값을 관리한다.
- *
- * 기능:
- * 1. 마지막 정상값 저장
- * 2. 순간 Jump 제거
- * 3. EMA 필터
- * 4. 연속 실패 횟수 관리
- */
-
-class SensorFilter
-{
-public:
-
-    /*
-     * 새 측정값을 입력한다.
-     *
-     * 반환값:
-     * true  = 사용할 수 있는 거리값 존재
-     * false = 센서 LOST
-     */
-
-    bool update(double newValue)
-    {
-        /*
-         * ====================================================
-         * 측정 실패
-         * ====================================================
-         */
-
-        if (newValue < 0.0)
-        {
-            m_failureCount++;
-
-
-            /*
-             * 이전에 정상값을 확보했고
-             * 실패 횟수가 허용 범위 안이라면
-             * 이전 필터값을 계속 사용한다.
-             */
-            if (m_initialized &&
-                m_failureCount <=
-                    MAX_SENSOR_FAILURE_COUNT)
-            {
-                return true;
-            }
-
-
-            return false;
-        }
-
-
-        /*
-         * ====================================================
-         * 첫 정상 측정값
-         * ====================================================
-         */
-
-        if (!m_initialized)
-        {
-            m_filteredValue =
-                newValue;
-
-            m_lastRawValue =
-                newValue;
-
-            m_initialized =
-                true;
-
-            m_failureCount =
-                0;
-
-            return true;
-        }
-
-
-        /*
-         * ====================================================
-         * 급격한 Jump 검사
-         * ====================================================
-         *
-         * 직전 정상 Raw 값에서 갑자기 너무 많이 변하면
-         * 반사 노이즈로 판단하고 이번 측정을 무시한다.
-         */
-
-        if (std::abs(
-                newValue -
-                m_lastRawValue)
-            > MAX_DISTANCE_JUMP_CM)
-        {
-            m_failureCount++;
-
-
-            if (m_failureCount <=
-                MAX_SENSOR_FAILURE_COUNT)
-            {
-                return true;
-            }
-
-
-            return false;
-        }
-
-
-        /*
-         * 정상 측정이므로 실패 횟수 초기화
-         */
-
-        m_failureCount = 0;
-
-
-        /*
-         * 이번 Raw 값을 정상값으로 저장
-         */
-
-        m_lastRawValue =
-            newValue;
-
-
-        /*
-         * ====================================================
-         * EMA Low Pass Filter
-         * ====================================================
-         */
-
-        m_filteredValue =
-            EMA_ALPHA *
-                newValue
-            +
-            (1.0 - EMA_ALPHA) *
-                m_filteredValue;
-
-
-        return true;
-    }
-
-
-    /*
-     * 현재 필터링된 거리값 반환
-     */
-
-    double value() const
-    {
-        return m_filteredValue;
-    }
-
-
-private:
-
-    bool m_initialized = false;
-
-    int m_failureCount = 0;
-
-    double m_lastRawValue = 0.0;
-
-    double m_filteredValue = 0.0;
-};
-
-
-/*
- * ============================================================
- * clampPWM()
- * ============================================================
- */
-
-int clampPWM(
-    int pwm,
-    int minPWM,
-    int maxPWM)
-{
-    return std::clamp(
-        pwm,
-        minPWM,
-        maxPWM);
-}
-
-
-/*
- * ============================================================
- * calculatePWMCorrection()
- * ============================================================
- *
- * P 제어 출력 계산.
- *
- * 특징:
- * 1. round() 사용
- * 2. Dead Zone 밖이면 최소 PWM 이동 보장
- * 3. 한 번에 지나치게 많이 움직이지 않도록 제한
- */
-
-int calculatePWMCorrection(
-    double error,
-    double kp,
-    int direction)
-{
-    /*
-     * Dead Zone 내부에서는 움직이지 않는다.
-     */
-
-    if (std::abs(error) <=
-        YAW_DEADZONE_CM)
-    {
-        return 0;
-    }
-
-
-    /*
-     * P 제어
-     */
-
-    double controlOutput =
-        kp *
-        error *
-        direction;
-
-
-    /*
-     * 기존 static_cast<int>()는
-     * 0.8 같은 값을 0으로 잘라버렸다.
-     *
-     * round()를 사용하면:
-     *
-     * 0.8 → 1
-     * 1.6 → 2
-     */
-
-    int correction =
-        static_cast<int>(
-            std::round(
-                controlOutput));
-
-
-    /*
-     * Dead Zone 밖인데도 0이 나온 경우
-     * 최소 이동량을 강제로 부여한다.
-     */
-
-    if (correction == 0)
-    {
-        correction =
-            (controlOutput > 0.0)
-            ? MIN_PWM_STEP
-            : -MIN_PWM_STEP;
-    }
-
-
-    /*
-     * 한 루프 최대 이동량 제한
-     */
-
-    correction =
-        std::clamp(
-            correction,
-            -MAX_PWM_STEP,
-            MAX_PWM_STEP);
-
-
-    return correction;
-}
-
-
-/*
- * ============================================================
- * main()
+ * main
  * ============================================================
  */
 
@@ -863,7 +511,10 @@ int main()
 {
     std::cout
         << "========================================\n"
-        << "   Seeker Tracking Test Ver.2\n"
+        << " Yaw + Pitch Integrated Seeker Test\n"
+        << " Yaw   : LEFT / RIGHT\n"
+        << " Pitch : LEFT / BOTTOM\n"
+        << " Lost  : HOLD\n"
         << "========================================\n";
 
 
@@ -890,7 +541,7 @@ int main()
 
     /*
      * ========================================================
-     * 초음파 센서 생성
+     * Sensor 생성
      * ========================================================
      */
 
@@ -910,66 +561,45 @@ int main()
 
 
     /*
-     * 각 센서별 필터
-     */
-
-    SensorFilter leftFilter;
-    SensorFilter rightFilter;
-    SensorFilter bottomFilter;
-
-
-    /*
      * ========================================================
-     * Servo 초기값
+     * Servo 초기 위치
      * ========================================================
      */
 
     int yawPWM =
-        SERVO_BOTTOM_CENTER_PWM;
+        YAW_CENTER_PWM;
+
 
     int pitchPWM =
-        SERVO_TOP_CENTER_PWM;
+        PITCH_CENTER_PWM;
 
-
-    /*
-     * 시작 시 시커 중심 정렬
-     */
 
     pwm.setPWM(
-        SERVO_BOTTOM_CHANNEL,
+        YAW_SERVO_CHANNEL,
         0,
         yawPWM);
 
 
     pwm.setPWM(
-        SERVO_TOP_CHANNEL,
+        PITCH_SERVO_CHANNEL,
         0,
         pitchPWM);
 
 
     std::cout
-        << "[INIT] Yaw PWM   : "
+        << "[INIT] Yaw PWM = "
         << yawPWM
         << '\n';
 
 
     std::cout
-        << "[INIT] Pitch PWM : "
+        << "[INIT] Pitch PWM = "
         << pitchPWM
         << '\n';
 
 
-    /*
-     * 서보 중심 이동 대기
-     */
-
     std::this_thread::sleep_for(
         std::chrono::seconds(1));
-
-
-    std::cout
-        << "\nTracking Start\n"
-        << "Ctrl+C : 종료\n\n";
 
 
     /*
@@ -986,13 +616,8 @@ int main()
          * ====================================================
          */
 
-        double rawLeft =
+        double leftDistance =
             leftSensor.measureDistance();
-
-
-        bool leftValid =
-            leftFilter.update(
-                rawLeft);
 
 
         std::this_thread::sleep_for(
@@ -1006,13 +631,8 @@ int main()
          * ====================================================
          */
 
-        double rawRight =
+        double rightDistance =
             rightSensor.measureDistance();
-
-
-        bool rightValid =
-            rightFilter.update(
-                rawRight);
 
 
         std::this_thread::sleep_for(
@@ -1026,220 +646,327 @@ int main()
          * ====================================================
          */
 
-        double rawBottom =
+        double bottomDistance =
             bottomSensor.measureDistance();
 
 
+        /*
+         * Sensor Validity
+         */
+
+        bool leftValid =
+            leftDistance >= 0.0;
+
+
+        bool rightValid =
+            rightDistance >= 0.0;
+
+
         bool bottomValid =
-            bottomFilter.update(
-                rawBottom);
+            bottomDistance >= 0.0;
 
 
         /*
-         * ====================================================
-         * 센서 상태 확인
-         * ====================================================
+         * Debug용 Error
          */
 
-        if (!leftValid ||
-            !rightValid ||
-            !bottomValid)
-        {
-            std::cout
-                << "[TARGET LOST]"
-                << " RawL=" << rawLeft
-                << " RawR=" << rawRight
-                << " RawB=" << rawBottom
-                << '\n';
+        double yawError = 0.0;
 
-
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(
-                    CONTROL_PERIOD_MS));
-
-
-            continue;
-        }
-
-
-        /*
-         * 필터를 통과한 거리값 사용
-         */
-
-        double leftDistance =
-            leftFilter.value();
-
-
-        double rightDistance =
-            rightFilter.value();
-
-
-        double bottomDistance =
-            bottomFilter.value();
+        double pitchError = 0.0;
 
 
         /*
          * ====================================================
-         * Yaw Error
-         * ====================================================
-         */
-
-        double yawError =
-            leftDistance -
-            rightDistance;
-
-
-        /*
-         * ====================================================
-         * Pitch Error
-         * ====================================================
-         */
-
-        double upperAverage =
-            (leftDistance +
-             rightDistance)
-            / 2.0;
-
-
-        double pitchError =
-            upperAverage -
-            bottomDistance;
-
-
-        /*
-         * ====================================================
-         * Yaw P Control
-         * ====================================================
-         */
-
-        int yawCorrection =
-            calculatePWMCorrection(
-                yawError,
-                KP_YAW,
-                YAW_DIRECTION);
-
-
-        if (yawCorrection != 0)
-        {
-            yawPWM +=
-                yawCorrection;
-
-
-            yawPWM =
-                clampPWM(
-                    yawPWM,
-                    BOTTOM_PWM_MIN,
-                    BOTTOM_PWM_MAX);
-
-
-            pwm.setPWM(
-                SERVO_BOTTOM_CHANNEL,
-                0,
-                yawPWM);
-        }
-
-
-        /*
-         * ====================================================
-         * Pitch P Control
+         * YAW CONTROL
          * ====================================================
          *
-         * Pitch에서도 동일한 방식 사용.
+         * 기존 Yaw 단독 테스트의 동작을 그대로 사용한다.
          */
 
-        int pitchCorrection = 0;
 
+        /*
+         * LEFT + RIGHT 둘 다 검출
+         */
 
-        if (std::abs(pitchError) >
-            PITCH_DEADZONE_CM)
+        if (leftValid &&
+            rightValid)
         {
-            double pitchControl =
-                KP_PITCH *
-                pitchError *
-                PITCH_DIRECTION;
+            yawError =
+                leftDistance -
+                rightDistance;
 
 
-            pitchCorrection =
-                static_cast<int>(
-                    std::round(
-                        pitchControl));
+            /*
+             * Dead Zone
+             */
 
-
-            if (pitchCorrection == 0)
+            if (std::abs(yawError) <=
+                YAW_DEADZONE_CM)
             {
-                pitchCorrection =
-                    (pitchControl > 0.0)
-                    ? MIN_PWM_STEP
-                    : -MIN_PWM_STEP;
+                std::cout
+                    << "[YAW CENTER] ";
             }
 
 
-            pitchCorrection =
-                std::clamp(
-                    pitchCorrection,
-                    -MAX_PWM_STEP,
-                    MAX_PWM_STEP);
+            /*
+             * LEFT가 더 가까움
+             */
+
+            else if (
+                leftDistance <
+                rightDistance)
+            {
+                yawPWM +=
+                    YAW_PWM_STEP *
+                    YAW_DIRECTION;
 
 
-            pitchPWM +=
-                pitchCorrection;
+                std::cout
+                    << "[YAW LEFT] ";
+            }
 
 
-            pitchPWM =
-                clampPWM(
-                    pitchPWM,
-                    TOP_PWM_MIN,
-                    TOP_PWM_MAX);
+            /*
+             * RIGHT가 더 가까움
+             */
+
+            else
+            {
+                yawPWM -=
+                    YAW_PWM_STEP *
+                    YAW_DIRECTION;
 
 
-            pwm.setPWM(
-                SERVO_TOP_CHANNEL,
-                0,
-                pitchPWM);
+                std::cout
+                    << "[YAW RIGHT] ";
+            }
         }
 
 
         /*
+         * LEFT만 검출
+         */
+
+        else if (
+            leftValid &&
+            !rightValid)
+        {
+            yawPWM +=
+                YAW_PWM_STEP *
+                YAW_DIRECTION;
+
+
+            std::cout
+                << "[YAW LEFT ONLY] ";
+        }
+
+
+        /*
+         * RIGHT만 검출
+         */
+
+        else if (
+            rightValid &&
+            !leftValid)
+        {
+            yawPWM -=
+                YAW_PWM_STEP *
+                YAW_DIRECTION;
+
+
+            std::cout
+                << "[YAW RIGHT ONLY] ";
+        }
+
+
+        /*
+         * 둘 다 LOST
+         */
+
+        else
+        {
+            /*
+             * 중심으로 복귀하지 않는다.
+             */
+
+            std::cout
+                << "[YAW HOLD] ";
+        }
+
+
+        /*
+         * Yaw 안전 범위
+         */
+
+        yawPWM =
+            std::clamp(
+                yawPWM,
+                YAW_PWM_MIN,
+                YAW_PWM_MAX);
+
+
+        /*
          * ====================================================
-         * Debug 출력
+         * PITCH CONTROL
          * ====================================================
          *
-         * RAW 값과 Filter 값을 동시에 출력해서
-         * 필터가 제대로 동작하는지 확인한다.
+         * LEFT - BOTTOM 기반으로 Pitch를 제어한다.
+         *
+         * LEFT와 BOTTOM 둘 다 검출되어야만
+         * Pitch를 움직인다.
+         */
+
+
+        if (leftValid &&
+            bottomValid)
+        {
+            pitchError =
+                leftDistance -
+                bottomDistance;
+
+
+            /*
+             * 이상치
+             *
+             * 센서 간 거리 차이가 너무 크면
+             * 정상적인 추적 오차가 아니라
+             * 측정 이상으로 판단하고 현재 위치를 유지한다.
+             */
+
+            if (std::abs(pitchError) >=
+                PITCH_MAX_ERROR_CM)
+            {
+                std::cout
+                    << "[PITCH OUTLIER -> HOLD] ";
+            }
+
+
+            /*
+             * Dead Zone
+             *
+             * Pitch Error가 ±1.0 cm 이내라면
+             * 중심 부근으로 판단하고 움직이지 않는다.
+             */
+
+            else if (std::abs(pitchError) <=
+                     PITCH_DEADZONE_CM)
+            {
+                std::cout
+                    << "[PITCH CENTER] ";
+            }
+
+
+            /*
+             * Error > Dead Zone
+             */
+
+            else if (pitchError > 0.0)
+            {
+                pitchPWM +=
+                    PITCH_PWM_STEP *
+                    PITCH_DIRECTION;
+
+
+                std::cout
+                    << "[PITCH A] ";
+            }
+
+
+            /*
+             * Error < -Dead Zone
+             */
+
+            else
+            {
+                pitchPWM -=
+                    PITCH_PWM_STEP *
+                    PITCH_DIRECTION;
+
+
+                std::cout
+                    << "[PITCH B] ";
+            }
+        }
+
+
+        /*
+         * LEFT 또는 BOTTOM 측정 실패
+         */
+
+        else
+        {
+            /*
+             * 자동 복귀하지 않고
+             * 현재 Pitch 위치 유지
+             */
+
+            std::cout
+                << "[PITCH HOLD] ";
+        }
+
+
+        /*
+         * Pitch 안전 범위
+         */
+
+        pitchPWM =
+            std::clamp(
+                pitchPWM,
+                PITCH_PWM_MIN,
+                PITCH_PWM_MAX);
+
+
+        /*
+         * ====================================================
+         * Servo 적용
+         * ====================================================
+         */
+
+        pwm.setPWM(
+            YAW_SERVO_CHANNEL,
+            0,
+            yawPWM);
+
+
+        pwm.setPWM(
+            PITCH_SERVO_CHANNEL,
+            0,
+            pitchPWM);
+
+
+        /*
+         * ====================================================
+         * Debug
+         * ====================================================
          */
 
         std::cout
-            << "RAW["
-            << rawLeft << ", "
-            << rawRight << ", "
-            << rawBottom << "]  "
+            << "L="
+            << leftDistance
 
-            << "FILT["
-            << leftDistance << ", "
-            << rightDistance << ", "
-            << bottomDistance << "]  |  "
+            << " R="
+            << rightDistance
 
-            << "Err Y:"
+            << " B="
+            << bottomDistance
+
+            << " YawErr="
             << yawError
-            << " P:"
+
+            << " PitchErr="
             << pitchError
-            << "  |  "
 
-            << "PWM Y:"
+            << " YawPWM="
             << yawPWM
-            << " P:"
-            << pitchPWM
-            << "  |  "
 
-            << "dPWM Y:"
-            << yawCorrection
-            << " P:"
-            << pitchCorrection
+            << " PitchPWM="
+            << pitchPWM
+
             << '\n';
 
 
         /*
-         * 전체 루프 추가 대기
+         * 다음 제어 루프
          */
 
         std::this_thread::sleep_for(
