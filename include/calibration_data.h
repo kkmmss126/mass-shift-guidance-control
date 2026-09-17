@@ -4,64 +4,212 @@
  * ============================================================
  * File Name : calibration_data.h
  *
- * Description
- * ------------------------------------------------------------
- * 실제 하드웨어 측정을 통해 얻은 초기화 및 캘리브레이션
- * 기준값을 한 곳에서 관리하기 위한 헤더 파일이다.
- *
- * 하드웨어 교체, 재조립 또는 구조 변경 시
- * 해당 값은 다시 측정해야 할 수 있다.
- *
  * Project
  * ------------------------------------------------------------
  * Mass Shift Guidance Control System
+ *
+ * Description
+ * ------------------------------------------------------------
+ * 시스템의 실제 캘리브레이션 결과를 한 곳에서 관리한다.
+ *
+ * 원칙:
+ * 1. 아래 [MEASURED VALUES] 영역만 수정한다.
+ * 2. main.cpp / phase 코드에는 실측값을 직접 작성하지 않는다.
+ * 3. 프로그램 시작 시
+ *
+ *      Body Yaw      : 정면 = 0 step
+ *      Mass Shift    : 기계적 중심 = 0 step
+ *
+ *    으로 정의한다.
+ *
+ * Control Structure
+ * ------------------------------------------------------------
+ * Seeker Yaw Error
+ *      -> Body Yaw Stepper
+ *      -> 동체 좌/우 회전
+ *
+ * Seeker Pitch Error
+ *      -> Mass Shift
+ *      -> 동체 상/하 Pitch 제어
  * ============================================================
  */
 
+namespace Calibration
+{
 
-/* ============================================================
- * 1. Servo Motor Calibration
- * ============================================================
- *
- * PCA9685를 이용하여 서보모터를 초기 자세로 정렬할 때
- * 사용하는 PWM 기준값이다.
- */
-
-// 아래쪽 서보 초기 PWM 값
-constexpr int SERVO_BOTTOM_INIT_PWM = 300;
-
-// 위쪽 서보 초기 PWM 값
-constexpr int SERVO_TOP_INIT_PWM = 321;
+// ============================================================
+//              [ MEASURED VALUES ]
+//
+//     실제 캘리브레이션 후 이 부분만 수정
+// ============================================================
 
 
-/* ============================================================
- * 2. SM1504 Linear Stepper Motor Calibration
- * ============================================================
- *
- * 스텝모터 시작 기준 위치를 0 step으로 설정했을 때,
- * 질량 이동 장치가 기계적 중심에 위치하기 위한 이동량이다.
- */
+// ------------------------------------------------------------
+// 1. Seeker Servo Center
+// ------------------------------------------------------------
+//
+// 실제 최종 캘리브레이션 값
+//
+// Channel 0 : Pitch
+// Channel 1 : Yaw
+//
 
-// 시작 위치 기준 중심 위치
-constexpr int SM1504_CENTER_STEP = 1690;
+constexpr int SEEKER_PITCH_CENTER_PWM = 321;
+constexpr int SEEKER_YAW_CENTER_PWM   = 300;
 
 
-/* ============================================================
- * 3. MPU6050 Gyroscope Calibration
- * ============================================================
- *
- * MPU6050을 정지 상태로 유지한 뒤 다수의 Raw 데이터를
- * 측정하여 평균한 자이로 오프셋(Bias) 값이다.
- *
- * 실제 자이로 측정값에서 아래 Bias 값을 제거하여
- * 센서의 정적 오차를 보정한다.
- */
+// ------------------------------------------------------------
+// 2. Seeker Servo Safe Range
+// ------------------------------------------------------------
+//
+// 서보 기구물 충돌 방지를 위한 안전 범위
+//
 
-// X축 자이로 Bias
-constexpr float GYRO_X_BIAS = 76.09f;
+constexpr int SEEKER_PITCH_MIN_PWM = 200;
+constexpr int SEEKER_PITCH_MAX_PWM = 450;
 
-// Y축 자이로 Bias
-constexpr float GYRO_Y_BIAS = -94.12f;
+constexpr int SEEKER_YAW_MIN_PWM = 200;
+constexpr int SEEKER_YAW_MAX_PWM = 450;
 
-// Z축 자이로 Bias
-constexpr float GYRO_Z_BIAS = -19.14f;
+
+// ------------------------------------------------------------
+// 3. Seeker Sensor Center Offset
+// ------------------------------------------------------------
+//
+// Yaw Raw Error
+//
+//      Left - Right
+//
+// 정중앙 표적에서 측정한 평균 오차 입력
+//
+
+constexpr double YAW_CENTER_OFFSET_CM = 0.0;
+
+
+// Pitch Raw Error
+//
+//      ((Left + Right) / 2) - Bottom
+//
+// 정중앙 표적에서 측정한 평균 오차 입력
+//
+
+constexpr double PITCH_CENTER_OFFSET_CM = 0.0;
+
+
+// ------------------------------------------------------------
+// 4. MPU6050 Gyro Bias
+// ------------------------------------------------------------
+//
+// imu_bias_measure.cpp 실행 후 출력되는 값을 그대로 입력
+//
+// Corrected Gyro:
+//
+//      corrected = raw - bias
+//
+
+constexpr double GYRO_X_BIAS = 0.0;
+constexpr double GYRO_Y_BIAS = 0.0;
+constexpr double GYRO_Z_BIAS = 0.0;
+
+
+// ------------------------------------------------------------
+// 5. Body Yaw Stepper Calibration
+// ------------------------------------------------------------
+//
+// 좌/우 제어용 동체 회전 스텝모터
+//
+// 프로그램 시작 시:
+//
+//      동체 정면 = 0 step
+//
+// 실제 좌/우 안전 한계 측정 후 입력
+//
+
+constexpr int BODY_YAW_MIN_STEP = 0;
+constexpr int BODY_YAW_MAX_STEP = 0;
+
+
+// 실제 모터 방향 확인 후 설정
+//
+//  1  : 현재 방향 그대로
+// -1  : 방향 반전
+//
+
+constexpr int BODY_YAW_DIRECTION = 1;
+
+
+// ------------------------------------------------------------
+// 6. Mass Shift Pitch Calibration
+// ------------------------------------------------------------
+//
+// 상/하 Pitch 제어용 질량이동 장치
+//
+// 프로그램 시작 시:
+//
+//      질량 기계적 중심 = 0 step
+//
+// 실제 이동 안전 한계 측정 후 입력
+//
+
+constexpr int MASS_SHIFT_MIN_STEP = 0;
+constexpr int MASS_SHIFT_MAX_STEP = 0;
+
+
+// 실제 모터 방향 확인 후 설정
+//
+//  1  : 현재 방향 그대로
+// -1  : 방향 반전
+//
+
+constexpr int MASS_SHIFT_DIRECTION = 1;
+
+
+// ============================================================
+//              [ FIXED REFERENCE VALUES ]
+//
+//       일반적으로 수정하지 않는 영역
+// ============================================================
+
+
+// ------------------------------------------------------------
+// Seeker PCA9685 Channel
+// ------------------------------------------------------------
+
+constexpr int SEEKER_PITCH_CHANNEL = 0;
+constexpr int SEEKER_YAW_CHANNEL   = 1;
+
+
+// ------------------------------------------------------------
+// Program Coordinate Reference
+// ------------------------------------------------------------
+//
+// 프로그램 시작 시 기계적 중심을 0으로 정의
+//
+
+constexpr int BODY_YAW_CENTER_STEP  = 0;
+constexpr int MASS_SHIFT_CENTER_STEP = 0;
+
+
+// ------------------------------------------------------------
+// Seeker Error Definition
+// ------------------------------------------------------------
+//
+// Yaw:
+//
+//      Raw Error = Left - Right
+//
+//      Corrected Error
+//          = Raw Error - YAW_CENTER_OFFSET_CM
+//
+//
+// Pitch:
+//
+//      Raw Error
+//          = ((Left + Right) / 2) - Bottom
+//
+//      Corrected Error
+//          = Raw Error - PITCH_CENTER_OFFSET_CM
+//
+// ------------------------------------------------------------
+
+} // namespace Calibration

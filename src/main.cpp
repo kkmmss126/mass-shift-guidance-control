@@ -1,299 +1,138 @@
-#include <iostream>   // 콘솔 출력(std::cout)을 위한 라이브러리
-#include <cmath>      // abs() 등 수학 함수 사용
-#include <thread>     // sleep_for 사용
-#include <chrono>     // 시간 제어(ms) 사용
-#include <string>     // string 자료형 사용
-#include <atomic>     // std::atomic을 이용한 스레드 간 안전한 변수 공유
+#include <atomic>
+#include <chrono>
+#include <iostream>
+#include <thread>
 
-/*
- * 실제 하드웨어 측정을 통해 확보한
- * 캘리브레이션 값을 불러온다.
- *
- * 현재 저장된 값
- * ------------------------------------------------------------
- * Servo Bottom Init PWM : 300
- * Servo Top Init PWM    : 321
- * SM1504 Center         : 1690 step
- *
- * MPU6050 Gyro Bias
- * X :  76.09
- * Y : -94.12
- * Z : -19.14
- */
 #include "calibration_data.h"
-
-/*
- * 실제 하드웨어 제어용 자체 라이브러리
- * 현재 단계에서는 이미 개별 테스트가 완료된
- * 자체 작성 라이브러리를 이용하여 전체 시스템을 통합한다.
- */
-#include "PCA9685.h"
 #include "MPU6050.h"
+#include "PCA9685.h"
 #include "StepperMotor.h"
 
-// ============================================================
-// 시스템 상태 정의
-// ============================================================
 /*
- * 상태 머신(State Machine)을 이용하여
- * 전체 유도 과정을 Phase별로 관리한다.
+ * ============================================================
+ * File Name : main.cpp
+ *
+ * Step 1 Integration Version
+ * ------------------------------------------------------------
+ * 목적:
+ * 1. Phase 2 구조는 보존하되 현재 Step 1에서는 비활성화한다.
+ * 2. Body Yaw / Mass Shift Pitch 스텝모터를 초기화한다.
+ * 3. 프로그램 시작 시 현재 물리적 위치를 0 step으로 정의한다.
+ * 4. 기존 SM1504_CENTER_STEP 자동 중심 이동을 제거한다.
+ * 5. 시커 서보를 calibration_data.h의 중심 PWM으로 이동시킨다.
+ * 6. Phase 3 진입 후 q 입력을 기다린다.
+ * 7. q 입력 시 누적 step 기준으로 두 축을 시작 위치(0)로 복귀한다.
+ *
+ * 이번 단계에서는:
+ * - Seeker V1 미연결
+ * - 새 Body Tracking 제어 미연결
+ * - P 제어 미연결
+ * - IMU는 초기화 및 Bias 로드 확인만 수행
+ *
+ * Axis Definition
+ * ------------------------------------------------------------
+ * Body Yaw
+ *   STEP : GPIO19
+ *   DIR  : GPIO26
+ *
+ * Mass Shift Pitch (SM1504)
+ *   STEP : GPIO17
+ *   DIR  : GPIO27
+ *
+ * A4988 ENABLE은 GND에 고정하므로 GPIO 제어를 사용하지 않는다.
+ * StepperMotor 생성자에는 enablePin = -1을 전달한다.
+ * ============================================================
  */
+
+
+// ============================================================
+// System State
+// ============================================================
+
 enum class SystemState
 {
-    INITIALIZING,       // Phase 1 : 센서 및 구동기 초기화
-
-    MIDCOURSE_GUIDE,    // Phase 2 : 중간 유도
-
-    TERMINAL_LOCKON,    // Phase 3 : 시커 기반 종말 유도
-
-    BODY_TRACKING,      // Phase 4 : 동체-시커 정렬
-
-    MISSION_COMPLETE    // 전체 유도 과정 완료
+    INITIALIZING,
+    MIDCOURSE_GUIDE,    // Phase 2 : 현재 Step 1에서는 비활성
+    TERMINAL_LOCKON,
+    BODY_TRACKING,
+    MISSION_COMPLETE
 };
+
 
 // ============================================================
 // Hardware Configuration
 // ============================================================
-/*
- * 실제 회로도에서 결정한 GPIO 및 PCA9685 채널을 한 곳에서 관리한다.
- * 이후 핀맵이 변경되어도 아래 값만 수정하면 된다.
- */
+
 struct HardwareConstants
 {
-    /*
-     * PCA9685 Servo Channel
-     * 실제 OrCAD 회로도에서 연결한 채널 번호와
-     * 반드시 일치시켜야 한다.
-     */
-    static constexpr int SERVO_BOTTOM_CHANNEL = 1;
-    static constexpr int SERVO_TOP_CHANNEL    = 0;
+    // Body Yaw Stepper
+    static constexpr int BODY_YAW_STEP_PIN = 19;
+    static constexpr int BODY_YAW_DIR_PIN  = 26;
 
+    // Mass Shift Pitch / SM1504
+    static constexpr int MASS_SHIFT_STEP_PIN = 17;
+    static constexpr int MASS_SHIFT_DIR_PIN  = 27;
 
-    /*
-     * X축 SM1504
-     * 기존 StepperMotor 테스트에서 사용한 BCM GPIO 기준.
-     */
-    static constexpr int X_STEP_PIN   = 17;
-    static constexpr int X_DIR_PIN    = 27;
-    static constexpr int X_ENABLE_PIN = 22;
-
-
-    /*
-     * Y축 SM1504
-     * 이 부분은 최종 회로도에서 지정한 GPIO 번호로
-     * 변경해야 한다.
-     */
-    static constexpr int Y_STEP_PIN   = 23;   // 최종 핀번호 입력
-    static constexpr int Y_DIR_PIN    = 24;   // 최종 핀번호 입력
-    static constexpr int Y_ENABLE_PIN = 25;   // 최종 핀번호 입력
+    // ENABLE is hard-wired to GND.
+    static constexpr int UNUSED_ENABLE_PIN = -1;
 };
 
+
 // ============================================================
-// 전체 제어 시스템에서 사용하는 공통 상수
+// Control Constants
 // ============================================================
+
 struct ControlConstants
 {
-    /*
-     * 제어 루프 주기
-     * 20 ms = 50 Hz
-     */
-    static constexpr double LOOP_TIME_MS = 20.0;
-
-
-    /*
-     * Phase 2 동체 제한 이동량
-     *
-     * 현재 시뮬레이션에서는
-     * 한 제어 루프당 최대 2도를 이동하도록 제한한다.
-     */
-    static constexpr double MAX_ANGULAR_VELOCITY = 2.0;
-
-
-    /*
-     * 시커 좌표계 기준 중심각
-     *
-     * 현재 제어 알고리즘 내부에서는
-     * 상대 각도를 계산하기 위한 논리적인 중심값으로 사용한다.
-     *
-     * 실제 서보모터의 물리적 초기 위치는
-     * calibration_data.h에 저장된 PWM 값을 사용한다.
-     */
-    static constexpr double SEEKER_YAW_CENTER = 90.0;
-
-    static constexpr double SEEKER_PITCH_CENTER = 90.0;
-
-
-    /*
-     * Phase 3 Lock-On 허용 오차
-     */
-    static constexpr double LOCKON_THRESHOLD = 2.0;
-
-
-    /*
-     * Phase 4 동체-시커 최종 정렬 허용 오차
-     */
-    static constexpr double TRACKING_TOLERANCE = 0.5;
+    static constexpr int LOOP_TIME_MS = 20;
 };
 
 
 // ============================================================
-// 종합 유도 제어 클래스
+// Integrated Controller
 // ============================================================
+
 class IntegratedMissileController
 {
 private:
 
-    /*
-     * 현재 시스템 상태
-     *
-     * 시스템 시작 시 반드시 INITIALIZING 상태에서 시작한다.
-     */
     SystemState m_currentState = SystemState::INITIALIZING;
 
-    /*
-    * 사용자 안전 종료 요청 플래그
-    */
     std::atomic<bool> m_exitRequested{false};
 
-    // ========================================================
-    // 실제 Hardware Driver
-    // ========================================================
-    /*
-    * Phase 1 ~ Phase 4에서 공통으로 사용하기 때문에
-     * 각 Phase 내부에서 객체를 새로 생성하지 않고
-    * Controller가 하드웨어 객체를 소유하도록 한다.
-    *
-    * 이렇게 하면
-    *
-    * 초기화
-    *   ↓
-    * 중간유도
-    *   ↓
-    * 종말유도
-    *   ↓
-    * 동체제어
-    *
-    * 전체 과정에서 동일한 하드웨어 상태를 유지할 수 있다.
-    */
+
+    // --------------------------------------------------------
+    // Hardware Drivers
+    // --------------------------------------------------------
+
     PCA9685 m_pca9685;
     MPU6050 m_imu;
 
-    /*
-    * StepperMotor의 경우 실제 작성한 라이브러리의
-    * 생성자 형태에 맞춰 X/Y 두 객체를 생성한다.
-    *
-    * 정확한 생성자 형태는 StepperMotor.h 확인 후
-    * 바로 확정한다.
-    */
-    StepperMotor m_stepperX;
-    StepperMotor m_stepperY;
-
-    // ========================================================
-    // 동체 상태 변수
-    // ========================================================
-
-    /*
-     * 현재 동체 절대 각도
-     *
-     * 실제 하드웨어 연결 이후에는
-     * IMU의 자세 추정값을 이용하도록 변경한다.
-     */
-    double m_currentBodyX = 0.0;
-    double m_currentBodyY = 0.0;
-
-
-    // ========================================================
-    // 시커 상태 변수
-    // ========================================================
-
-    /*
-     * 동체 기준 시커 상대 Yaw / Pitch 각도
-     */
-    double m_seekerYawAngle = 0.0;
-    double m_seekerPitchAngle = 0.0;
-
-
-    /*
-     * Phase 4에서 사용하는 시커 절대 방향
-     */
-    double m_seekerAbsYaw = 0.0;
-    double m_seekerAbsPitch = 0.0;
-
-
-    /*
-     * 순간적인 오차 감소를 Lock-On으로 잘못 판단하지 않도록
-     * 일정 횟수 연속으로 조건을 만족했는지 확인한다.
-     */
-    int m_stableLockCount = 0;
-
-
-    // ========================================================
-    // Mock Data
-    // ========================================================
-    /*
-     * 아래 값들은 아직 실제 센서/통신 라이브러리가
-     * 메인 시스템에 연결되지 않았기 때문에 임시로 사용한다.
-     * 추후 외부 라이브러리 연결 시 실제 측정값으로 변경한다.
-     *
-     * 중요:
-     * calibration_data.h에 저장된 값은 Mock 값이 아니다.
-     * 실제 측정을 통해 확보한 하드웨어 기준값이다.
-     */
-
-
-    /*
-     * 현재 시커 추적 알고리즘 검증용 목표 위치
-     *
-     * 추후 초음파 센서 거리값을 이용한
-     * 타겟 방향 계산으로 변경한다.
-     */
-    double m_mockTargetX = 25.0;
-    double m_mockTargetY = 17.5;
-
-
-    /*
-     * 실시간 MPU6050 입력 연결 전
-     * 자세 외란을 모사하기 위한 각속도 값
-     *
-     * 추후:
-     *
-     * 실제 Gyro Raw
-     *      ↓
-     * calibration_data.h Bias 제거
-     *      ↓
-     * 보정된 Gyro Rate
-     *
-     * 구조로 변경한다.
-     */
-    double m_gyroYawRate = -5.0;
-    double m_gyroPitchRate = 3.0;
+    StepperMotor m_bodyYawStepper;
+    StepperMotor m_massShiftStepper;
 
 
 public:
 
     IntegratedMissileController()
-    : m_stepperX(
-          HardwareConstants::X_STEP_PIN,
-          HardwareConstants::X_DIR_PIN,
-          HardwareConstants::X_ENABLE_PIN
-      ),
-      m_stepperY(
-          HardwareConstants::Y_STEP_PIN,
-          HardwareConstants::Y_DIR_PIN,
-          HardwareConstants::Y_ENABLE_PIN
-      )
+        : m_bodyYawStepper(
+              HardwareConstants::BODY_YAW_STEP_PIN,
+              HardwareConstants::BODY_YAW_DIR_PIN,
+              HardwareConstants::UNUSED_ENABLE_PIN
+          ),
+          m_massShiftStepper(
+              HardwareConstants::MASS_SHIFT_STEP_PIN,
+              HardwareConstants::MASS_SHIFT_DIR_PIN,
+              HardwareConstants::UNUSED_ENABLE_PIN
+          )
     {
     }
 
-    /*
-    * 사용자 입력 감시
-    *
-    * 별도 스레드에서 키보드 입력을 기다린다.
-    * q 또는 Q가 입력되면 안전 종료 요청 플래그를 설정한다.
-    *
-    * 이 함수는 제어 루프와 독립적으로 실행되므로
-    * 센서/구동기 제어 루프를 정지시키지 않는다.
-    */
+
+    // ========================================================
+    // Exit Input Thread
+    // ========================================================
+
     void monitorExitInput()
     {
         char input;
@@ -308,337 +147,105 @@ public:
                     << "\n[SAFE EXIT] 종료 요청이 입력되었습니다.\n";
 
                 m_exitRequested = true;
-
                 break;
             }
         }
     }
 
-    /*
-    * 안전 종료 요청 확인
-    *
-    * 종료 요청이 들어온 경우 시스템 상태를
-    * MISSION_COMPLETE로 변경한다.
-    */
+
     bool checkExitRequest()
     {
-        if (m_exitRequested)
+        if (!m_exitRequested)
         {
-            m_currentState =
-                SystemState::MISSION_COMPLETE;
-
-            return true;
+            return false;
         }
 
-        return false;
-    }
-
-    // ========================================================
-    // Servo PWM 출력 인터페이스
-    // ========================================================
-    /*
-     * motorName을 이용하여 출력할 PCA9685 채널을 결정하고,
-     * calibration_data.h에서 전달된 PWM 값을 실제 PCA9685에 출력한다.
-     *
-     * PCA9685의 setPWM() 함수는
-     *
-     * setPWM(channel, ON count, OFF count)
-     *
-     * 형식으로 사용한다.
-     *
-     * 서보 제어에서는 일반적으로 ON count를 0으로 두고
-     * OFF count에 목표 PWM 값을 전달한다.
-     */
-    void writeServoPWM(
-        const std::string& motorName,
-        int pwmValue)
-    {
-        uint8_t channel = 0;
-
-
-        // ----------------------------------------------------
-        // Servo 이름에 따라 PCA9685 채널 결정
-        // ----------------------------------------------------
-
-        if (motorName == "Bottom Servo")
-        {
-            channel =
-                HardwareConstants::SERVO_BOTTOM_CHANNEL;
-        }
-        else if (motorName == "Top Servo")
-        {
-            channel =
-                HardwareConstants::SERVO_TOP_CHANNEL;
-        }
-        else
-        {
-            std::cerr
-                << " -> [ERROR] 알 수 없는 Servo 이름 : "
-                << motorName
-                << '\n';
-
-            return;
-        }
-
-
-        // ----------------------------------------------------
-        // 실제 PCA9685 PWM 출력
-        // ----------------------------------------------------
-        /*
-         * ON  = 0
-         * OFF = pwmValue
-         *
-         * calibration_data.h에 저장된 실제 중심 PWM 값을
-         * 그대로 PCA9685에 전달한다.
-         */
-
-        m_pca9685.setPWM(
-            channel,
-            0,
-            static_cast<uint16_t>(pwmValue)
-        );
-
-
-        // ----------------------------------------------------
-        // 디버깅 출력
-        // ----------------------------------------------------
-
-        std::cout
-            << " -> [Servo Init] "
-            << motorName
-            << " | Channel = "
-            << static_cast<int>(channel)
-            << " | PWM = "
-            << pwmValue
-            << '\n';
+        m_currentState = SystemState::MISSION_COMPLETE;
+        return true;
     }
 
 
     // ========================================================
-    // SM1504 Linear Actuator 중심 위치 설정
-    // ========================================================
-    /*
-     * X축과 Y축 SM1504를 모두 캘리브레이션된
-     * 중심 위치로 이동시킨다.
-     *
-     * 현재 단계에서는 시스템 시작 전에
-     * 두 액추에이터가 기준 시작 위치에 놓여 있다고 가정한다.
-     *
-     * 이후 리미트 스위치를 이용한 Homing 기능이 추가되면
-     *
-     * Homing
-     *   ↓
-     * 현재 위치 = 0 설정
-     *   ↓
-     * 중심 위치까지 이동
-     *
-     * 구조로 확장한다.
-     */
-    void writeLinearActuator(int targetStep)
-    {
-        /*
-         * 현재 최소 통합 테스트에서는
-         * X/Y 두 축이 동일한 중심 이동량을 가진다고 가정한다.
-         * 이후 실제 조립 후 축별 중심값 차이가 확인되면
-         * X/Y 값을 별도로 분리한다.
-         */
-
-        // ----------------------------------------------------
-        // X축 중심 위치 이동
-        // ----------------------------------------------------
-
-        if (!m_stepperX.moveSteps(targetStep))
-        {
-            std::cerr
-                << " -> [ERROR] X축 SM1504 이동 실패\n";
-
-            return;
-        }
-
-        std::cout
-            << " -> X축 SM1504 Center Position = "
-            << targetStep
-            << " step\n";
-
-
-        // ----------------------------------------------------
-        // Y축 중심 위치 이동
-        // ----------------------------------------------------
-
-        if (!m_stepperY.moveSteps(targetStep))
-        {
-            std::cerr
-                << " -> [ERROR] Y축 SM1504 이동 실패\n";
-
-            return;
-        }
-
-        std::cout
-            << " -> Y축 SM1504 Center Position = "
-            << targetStep
-            << " step\n";
-    }
-
-    // ========================================================
-    // Linear Actuator 시작 위치 복귀
-    // ========================================================
-    /*
-     * 마이크로 스위치 적용 전 테스트 목적
-     *
-     * 프로그램 실행 중 누적된 Step 위치를 기준으로
-     * X/Y 액추에이터를 최초 시작 위치(0 step)로 복귀시킨다.
-     *
-     * 현재 방식은 엔코더나 리미트 스위치가 없는
-     * Open-Loop 위치 추정 방식이다.
-     *
-     * 따라서 모터 탈조가 발생하지 않았다는 전제가 필요하다.
-     */
-    void returnLinearActuatorToStart()
-    {
-        // 현재 논리적 위치 확인
-        const long currentX = m_stepperX.getCurrentPosition();
-
-        const long currentY =  m_stepperY.getCurrentPosition();
-
-
-        std::cout
-            << "\n[Return] Linear Actuator 원위치 복귀 시작\n"
-            << " -> Current X : "
-            << currentX
-            << " step\n"
-            << " -> Current Y : "
-            << currentY
-            << " step\n";
-
-
-        // ----------------------------------------------------
-        // X축 원점 복귀
-        // ----------------------------------------------------
-        if (!m_stepperX.moveSteps(-static_cast<int>(currentX)))
-        {
-            std::cerr
-                << " -> [ERROR] X축 원위치 복귀 실패\n";
-        }
-
-
-        // ----------------------------------------------------
-        // Y축 원점 복귀
-        // ----------------------------------------------------
-
-        if (!m_stepperY.moveSteps(-static_cast<int>(currentY)))
-        {
-            std::cerr
-                << " -> [ERROR] Y축 원위치 복귀 실패\n";
-        }
-
-
-        std::cout
-            << " -> Linear Actuator 원위치 복귀 완료\n"
-            << " -> X Position : "
-            << m_stepperX.getCurrentPosition()
-            << " step\n"
-            << " -> Y Position : "
-            << m_stepperY.getCurrentPosition()
-            << " step\n";
-    }
-
-    // ========================================================
-    // 전체 상태 머신 실행
+    // Main State Machine
     // ========================================================
 
     void runSystem()
     {
         std::cout
-        << "==================================================\n"
-        << "      Mass Shift Guidance Control System\n"
-        << "==================================================\n"
-        << " q 입력 시 안전 종료\n"
-        << "==================================================\n";
+            << "==================================================\n"
+            << "   Mass Shift Guidance Control System - Step 1\n"
+            << "==================================================\n"
+            << " q 입력 시 안전 종료\n"
+            << "==================================================\n";
 
 
-    /*
-     * 사용자 종료 입력 감시 스레드
-     */
-    std::thread inputThread(
-        &IntegratedMissileController::monitorExitInput,this
-    );
+        std::thread inputThread(
+            &IntegratedMissileController::monitorExitInput,
+            this
+        );
 
-    inputThread.detach();
+        inputThread.detach();
+
 
         while (m_currentState != SystemState::MISSION_COMPLETE)
         {
-             if (checkExitRequest())
+            if (checkExitRequest())
             {
                 break;
             }
+
 
             switch (m_currentState)
             {
                 case SystemState::INITIALIZING:
 
                     processPhase1_Initializing();
-
                     break;
 
 
                 case SystemState::MIDCOURSE_GUIDE:
 
                     processPhase2_MidcourseGuide();
-
                     break;
 
 
                 case SystemState::TERMINAL_LOCKON:
 
-                    processPhase3_TerminalLockOn();
-
+                    processPhase3_TerminalLockOnPlaceholder();
                     break;
 
 
                 case SystemState::BODY_TRACKING:
 
-                    processPhase4_BodyTracking();
-
+                    processPhase4_BodyTrackingPlaceholder();
                     break;
 
 
                 default:
 
-                    m_currentState =
-                        SystemState::MISSION_COMPLETE;
-
+                    m_currentState = SystemState::MISSION_COMPLETE;
                     break;
             }
 
-            // 전체 상태 머신 기본 실행 주기
+
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(
-                    static_cast<long long>(
-                        ControlConstants::LOOP_TIME_MS
-                    )
+                    ControlConstants::LOOP_TIME_MS
                 )
             );
         }
-        
-        /*
-         * StepperMotor가 정상적으로 초기화된 경우에만
-         * 액추에이터 원위치 복귀를 수행한다.
-         */
-        if (
-            m_stepperX.isInitialized() &&
-            m_stepperY.isInitialized()
-        )
-        {
-        // 전체 Phase 종료 후 액추에이터 원위치 복귀
-        returnLinearActuatorToStart();
 
-        m_stepperX.disable();
-        m_stepperY.disable();
-        }
+
+        // ----------------------------------------------------
+        // Safe Return
+        // ----------------------------------------------------
+
+        returnSteppersToStart();
+
 
         std::cout
             << "\n==================================================\n"
-            << "      전체 유도 시뮬레이션 종료\n"
+            << "             시스템 종료 완료\n"
             << "==================================================\n";
     }
 
@@ -646,46 +253,57 @@ public:
 private:
 
     // ========================================================
-    // Phase 1
-    // Hardware Initialization & Calibration Data Loading
+    // Servo Center
     // ========================================================
-    /*
-     * 기존 코드에서는 가상의 자이로 데이터를 반복 측정하여
-     * Bias를 계산했지만,
-     *
-     * 현재는 실제 하드웨어 측정을 통해 이미 확보한 값을
-     * calibration_data.h에서 직접 불러온다.
-     *
-     * 수행 순서
-     *
-     * 1. MPU6050 실제 연결 및 초기화
-     * 2. PCA9685 실제 연결 및 초기화
-     * 3. SM1504 X/Y축 GPIO 초기화
-     * 4. 측정된 Gyro Bias 불러오기
-     * 5. Servo 초기 위치
-     * 6. Linear Actuator 중심 위치
-     */
+
+    void moveSeekerToCenter()
+    {
+        m_pca9685.setPWM(
+            Calibration::SEEKER_PITCH_CHANNEL,
+            0,
+            static_cast<uint16_t>(
+                Calibration::SEEKER_PITCH_CENTER_PWM
+            )
+        );
+
+        m_pca9685.setPWM(
+            Calibration::SEEKER_YAW_CHANNEL,
+            0,
+            static_cast<uint16_t>(
+                Calibration::SEEKER_YAW_CENTER_PWM
+            )
+        );
+
+
+        std::cout
+            << " -> Seeker center position applied\n"
+            << "    Pitch PWM : "
+            << Calibration::SEEKER_PITCH_CENTER_PWM
+            << '\n'
+            << "    Yaw PWM   : "
+            << Calibration::SEEKER_YAW_CENTER_PWM
+            << '\n';
+    }
+
+
+    // ========================================================
+    // Phase 1
+    // ========================================================
 
     void processPhase1_Initializing()
     {
-      std::cout
+        std::cout
             << "\n[Phase 1] 하드웨어 초기화 시작...\n";
 
+
         // ----------------------------------------------------
-        // 1. MPU6050 실제 연결 및 초기화
+        // MPU6050
         // ----------------------------------------------------
-        /*
-         * I2C 통신이 정상적으로 이루어지는지 확인한다.
-         *
-         * 초기화 실패 시 이후 Phase로 넘어가면
-         * 잘못된 자세 정보를 이용하여 구동기가 움직일 수 있으므로
-         * 시스템을 종료한다.
-         */
+
         if (!m_imu.begin())
         {
             std::cerr
-                << " -> [ERROR] MPU6050 초기화 실패\n"
-                << " -> 시스템을 종료합니다.\n";
+                << " -> [ERROR] MPU6050 초기화 실패\n";
 
             m_currentState = SystemState::MISSION_COMPLETE;
             return;
@@ -694,18 +312,15 @@ private:
         std::cout
             << " -> MPU6050 연결 성공\n";
 
+
         // ----------------------------------------------------
-        // 2. PCA9685 실제 연결 및 초기화
+        // PCA9685
         // ----------------------------------------------------
-        /*
-         * PCA9685와 I2C 통신이 정상적으로 이루어지는지 확인한다.
-         * 초기화 후 서보모터 구동을 위해 PWM 주파수를 50Hz로 설정한다.
-         */
+
         if (!m_pca9685.begin())
         {
             std::cerr
-                << " -> [ERROR] PCA9685 초기화 실패\n"
-                << " -> 시스템을 종료합니다.\n";
+                << " -> [ERROR] PCA9685 초기화 실패\n";
 
             m_currentState = SystemState::MISSION_COMPLETE;
             return;
@@ -716,534 +331,252 @@ private:
         std::cout
             << " -> PCA9685 연결 성공\n"
             << " -> PWM Frequency : 50 Hz\n";
-        
+
+
         // ----------------------------------------------------
-        // 3. SM1504 X/Y축 GPIO 초기화
+        // Body Yaw Stepper
         // ----------------------------------------------------
+
+        if (!m_bodyYawStepper.initialize())
+        {
+            std::cerr
+                << " -> [ERROR] Body Yaw Stepper 초기화 실패\n";
+
+            m_currentState = SystemState::MISSION_COMPLETE;
+            return;
+        }
+
+
+        // ----------------------------------------------------
+        // Mass Shift Pitch Stepper
+        // ----------------------------------------------------
+
+        if (!m_massShiftStepper.initialize())
+        {
+            std::cerr
+                << " -> [ERROR] Mass Shift Stepper 초기화 실패\n";
+
+            m_currentState = SystemState::MISSION_COMPLETE;
+            return;
+        }
+
+
         /*
-         * A4988에 연결된 X축과 Y축 스텝모터의
-         * GPIO 자원을 초기화한다.
+         * 현재 실제 위치를 프로그램상의 원점으로 선언한다.
          *
-         * 어느 한 축이라도 초기화에 실패하면
-         * 이후 질량 이동 제어를 수행할 수 없으므로
-         * 시스템을 종료한다.
+         * 여기서 모터를 움직이지 않는다.
          */
-        if (!m_stepperX.initialize())
-        {
-            std::cerr
-                << " -> [ERROR] X축 StepperMotor 초기화 실패\n"
-                << " -> 시스템을 종료합니다.\n";
+        m_bodyYawStepper.setCurrentPosition(0);
+        m_massShiftStepper.setCurrentPosition(0);
 
-            m_currentState = SystemState::MISSION_COMPLETE;
-            return;
-        }
 
-        if (!m_stepperY.initialize())
-        {
-            std::cerr
-                << " -> [ERROR] Y축 StepperMotor 초기화 실패\n"
-                << " -> 시스템을 종료합니다.\n";
+        std::cout
+            << " -> Stepper 초기화 성공\n"
+            << "    Body Yaw       : STEP GPIO19 / DIR GPIO26\n"
+            << "    Mass Shift     : STEP GPIO17 / DIR GPIO27\n"
+            << "    Current Position = 0 step\n";
 
-            m_currentState = SystemState::MISSION_COMPLETE;
-            return;
-        }
+
+        // ----------------------------------------------------
+        // Calibration Data
+        // ----------------------------------------------------
+
+        std::cout
+            << " -> MPU6050 Gyro Bias 로드\n"
+            << "    X : " << Calibration::GYRO_X_BIAS << '\n'
+            << "    Y : " << Calibration::GYRO_Y_BIAS << '\n'
+            << "    Z : " << Calibration::GYRO_Z_BIAS << '\n';
+
+
+        // ----------------------------------------------------
+        // Seeker Initial Center
+        // ----------------------------------------------------
+
+        moveSeekerToCenter();
+
 
         /*
-         * 프로그램 시작 시 현재 물리적 위치를
-         * 논리적 원점(0 step)으로 정의한다.
+         * 기존 SM1504_CENTER_STEP 이동은 수행하지 않는다.
+         *
+         * 프로그램 실행 직전 사람이 맞춰둔 실제 위치가
+         * Body Yaw / Mass Shift 모두 0점이다.
          */
-        m_stepperX.setCurrentPosition(0);
-        m_stepperY.setCurrentPosition(0);
+
 
         std::cout
-            << " -> X/Y축 StepperMotor 초기화 성공\n";
+            << " -> 전체 하드웨어 초기화 완료\n"
+            << " -> 현재 Step 1 통합 시험에서는 Phase 2를 비활성화합니다.\n"
+            << " -> [Phase 3]으로 직접 천이합니다.\n";
 
-        // ----------------------------------------------------
-        // 4. 측정된 Gyro Bias 불러오기
-        // ----------------------------------------------------
+
         /*
-         * imu_bias_measure.cpp에서 실제 측정한 값을
-         * calibration_data.h를 통해 불러온다.
+         * 정상 전체 알고리즘에서는 아래 전이를 사용한다.
+         *
+         * m_currentState = SystemState::MIDCOURSE_GUIDE;
+         *
+         * 하지만 현재 Step 1 통합 시험에서는
+         * Phase 2 기능을 아직 연결하지 않으므로
+         * Phase 3으로 직접 이동한다.
          */
-        const double gyroBiasX = GYRO_X_BIAS;
-        const double gyroBiasY = GYRO_Y_BIAS;
-        const double gyroBiasZ = GYRO_Z_BIAS;
+        // m_currentState = SystemState::MIDCOURSE_GUIDE;
 
-
-        std::cout
-            << " -> MPU6050 Gyro Bias 로드 완료\n"
-            << "    X : " << gyroBiasX << '\n'
-            << "    Y : " << gyroBiasY << '\n'
-            << "    Z : " << gyroBiasZ << '\n';
-
-
-        // ----------------------------------------------------
-        // 5. Servo 초기 위치
-        // ----------------------------------------------------
-        writeServoPWM(
-            "Bottom Servo",
-            SERVO_BOTTOM_INIT_PWM
-        );
-
-        writeServoPWM(
-            "Top Servo",
-            SERVO_TOP_INIT_PWM
-        );
-
-
-        // ----------------------------------------------------
-        // 6. Linear Actuator 중심 위치
-        // ----------------------------------------------------
-        writeLinearActuator(
-            SM1504_CENTER_STEP
-        );
-
-
-        std::cout
-            << " -> 전체 하드웨어 초기화 과정 완료\n"
-            << " -> [중간 유도 단계]로 천이합니다.\n";
-
-
-        m_currentState =
-            SystemState::MIDCOURSE_GUIDE;
+        m_currentState = SystemState::TERMINAL_LOCKON;
     }
 
 
     // ========================================================
     // Phase 2
-    // Midcourse Guidance
+    // Midcourse Guidance - Preserved / Currently Inactive
     // ========================================================
+
     void processPhase2_MidcourseGuide()
     {
-        std::cout
-            << "\n[Phase 2] 중간 유도 단계 진입: "
-            << "외부 명령 대기 중...\n";
-
-
         /*
-         * 아직 실제 UART/RS485 입력을 연결하지 않았으므로
-         * Mock 명령을 사용한다.
+         * 이 함수는 삭제하지 않는다.
          *
-         * 추후 통신 라이브러리 연결 시 실제 수신값으로 교체한다.
+         * 향후 전체 시스템에서는:
+         *
+         * 외부 명령 또는 예상 표적 사분면 입력
+         *          ↓
+         * 중간 유도 명령 생성
+         *          ↓
+         * 예상 표적 구역으로 시커/동체 유도
+         *          ↓
+         * Phase 3 Terminal Lock-On
+         *
+         * 순서로 사용한다.
+         *
+         * 현재 Step 1에서는 Phase 1에서 이 함수로
+         * 진입하지 않기 때문에 실제 실행되지 않는다.
          */
-        char mockPuttyInput = '1';
+
+        std::cout
+            << "\n[Phase 2] Midcourse Guidance\n"
+            << " -> 현재 Step 1에서는 비활성 상태입니다.\n"
+            << " -> Phase 3으로 천이합니다.\n";
 
 
-        double targetX = 0.0;
-        double targetY = 0.0;
+        m_currentState = SystemState::TERMINAL_LOCKON;
+    }
 
 
-        if (mockPuttyInput == '1')
+    // ========================================================
+    // Phase 3 Placeholder
+    // ========================================================
+
+    void processPhase3_TerminalLockOnPlaceholder()
+    {
+        /*
+         * Step 1에서는 Seeker V1을 아직 연결하지 않는다.
+         *
+         * 초기화가 정상 완료된 상태에서 대기하면서
+         * q 안전 종료 경로만 검증한다.
+         */
+
+        static bool printed = false;
+
+        if (!printed)
         {
-            targetX = 15.0;
-            targetY = 12.5;
+            std::cout
+                << "\n[Phase 3] Placeholder\n"
+                << " -> Seeker V1은 아직 연결하지 않았습니다.\n"
+                << " -> 현재는 q 종료 시험을 위한 대기 상태입니다.\n"
+                << " -> q 입력 시 두 스텝모터가 누적 step 기준 "
+                << "0점으로 복귀합니다.\n";
+
+            printed = true;
         }
 
 
-        std::cout
-            << " -> [Command] '1' 수신"
-            << " | 목표 X: "
-            << targetX
-            << "도"
-            << " | 목표 Y: "
-            << targetY
-            << "도\n";
+        checkExitRequest();
+    }
 
 
-        while (
-            m_currentBodyX < targetX ||
-            m_currentBodyY < targetY
+    // ========================================================
+    // Phase 4 Placeholder
+    // ========================================================
+
+    void processPhase4_BodyTrackingPlaceholder()
+    {
+        /*
+         * 이번 단계에서는 진입하지 않는다.
+         * 향후 Seeker V1 검증 이후 실제 로직으로 교체한다.
+         */
+
+        checkExitRequest();
+    }
+
+
+    // ========================================================
+    // Return to Program Start Position
+    // ========================================================
+
+    void returnSteppersToStart()
+    {
+        /*
+         * 두 모터 모두 정상 초기화된 경우에만 복귀한다.
+         *
+         * ENABLE은 GND 고정이므로 disable()은 호출하지 않는다.
+         */
+
+        if (
+            !m_bodyYawStepper.isInitialized() ||
+            !m_massShiftStepper.isInitialized()
         )
         {
-            /*
-             * 사용자 안전 종료 요청 확인
-             */
-            if (checkExitRequest())
-            {
-                break;
-            }
-
-
-            if (m_currentBodyX < targetX)
-            {
-                m_currentBodyX +=
-                    ControlConstants::MAX_ANGULAR_VELOCITY;
-            }
-
-
-            if (m_currentBodyY < targetY)
-            {
-                m_currentBodyY +=
-                    ControlConstants::MAX_ANGULAR_VELOCITY;
-            }
-
-
-            /*
-             * 목표값을 초과하지 않도록 제한한다.
-             */
-            if (m_currentBodyX > targetX)
-            {
-                m_currentBodyX = targetX;
-            }
-
-
-            if (m_currentBodyY > targetY)
-            {
-                m_currentBodyY = targetY;
-            }
-
-
-            std::cout
-                << " [기동중] 동체 절대 각도"
-                << " | X: "
-                << m_currentBodyX
-                << "도"
-                << " | Y: "
-                << m_currentBodyY
-                << "도\n";
-
-
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(
-                    static_cast<long long>(
-                        ControlConstants::LOOP_TIME_MS
-                    )
-                )
-            );
-        }
-        
-        if (checkExitRequest())
-        {
             return;
         }
 
+
+        const long currentBodyYaw =
+            m_bodyYawStepper.getCurrentPosition();
+
+        const long currentMassShift =
+            m_massShiftStepper.getCurrentPosition();
+
+
         std::cout
-            << " -> 목표 사분면 도달\n"
-            << " -> [종말 유도 단계]로 천이합니다.\n";
+            << "\n[RETURN] 시작 위치 복귀\n"
+            << " -> Body Yaw Current   : "
+            << currentBodyYaw
+            << " step\n"
+            << " -> Mass Shift Current : "
+            << currentMassShift
+            << " step\n";
 
 
-        m_currentState =
-            SystemState::TERMINAL_LOCKON;
-    }
+        if (currentBodyYaw != 0)
+        {
+            if (!m_bodyYawStepper.moveSteps(
+                    -static_cast<int>(currentBodyYaw)
+                ))
+            {
+                std::cerr
+                    << " -> [ERROR] Body Yaw 원점 복귀 실패\n";
+            }
+        }
 
 
-    // ========================================================
-    // Phase 3
-    // Terminal Guidance / Seeker Lock-On
-    // ========================================================
-    /*
-     * 현재 추적 알고리즘은 유지한다.
-     *
-     * 초음파 센서 및 MPU6050 실시간 입력은
-     * 추후 외부 라이브러리를 연결하면서 교체한다.
-     */
-    void processPhase3_TerminalLockOn()
-    {
+        if (currentMassShift != 0)
+        {
+            if (!m_massShiftStepper.moveSteps(
+                    -static_cast<int>(currentMassShift)
+                ))
+            {
+                std::cerr
+                    << " -> [ERROR] Mass Shift 원점 복귀 실패\n";
+            }
+        }
+
+
         std::cout
-            << "\n[Phase 3] 종말 유도 단계 진입: "
-            << "시커 추적 시작\n";
-
-
-        /*
-         * 제어 주기를 초 단위로 변환한다.
-         *
-         * Gyro Rate(deg/s)를 이용하여
-         * 한 제어 주기 동안 발생한 각도 변화를 계산하기 위해 사용한다.
-         */
-        const double dt =
-            ControlConstants::LOOP_TIME_MS / 1000.0;
-
-
-        while(true)
-        {
-            // ------------------------------------------------
-            // 현재는 알고리즘 검증용 Mock 목표값 사용
-            // ------------------------------------------------
-            /*
-             * 추후 이 부분은 3개의 초음파 센서 거리값을
-             * 입력으로 받는 타겟 방향 계산 함수로 교체한다.
-             */
-
-            //사용자 안전 종료 요청 확인
-            if (checkExitRequest())
-            {
-                break;
-            }
-
-            double seekerErrorX =
-                m_mockTargetX -
-                m_seekerYawAngle;
-
-
-            double seekerErrorY =
-                m_mockTargetY -
-                m_seekerPitchAngle;
-
-
-            /*
-             * 시커 P 제어 Gain
-             */
-            const double trackingGain = 0.3;
-
-
-            /*
-             * 목표 추적 보정량
-             *
-             * Target Error 기반 P 제어
-             * +
-             * Gyro Rate 역보상
-             */
-            double deltaYaw =
-                (seekerErrorX * trackingGain)
-                -
-                (m_gyroYawRate * dt);
-
-
-            double deltaPitch =
-                (seekerErrorY * trackingGain)
-                -
-                (m_gyroPitchRate * dt);
-
-
-            m_seekerYawAngle += deltaYaw;
-            m_seekerPitchAngle += deltaPitch;
-
-
-            /*
-             * 알고리즘 내부 논리 중심각 90도를 기준으로
-             * 현재 시커 절대 방향을 계산한다.
-             *
-             * 실제 Servo PWM 중심값은
-             * calibration_data.h의 값을 사용한다.
-             */
-            double finalScaleYaw =
-                ControlConstants::SEEKER_YAW_CENTER
-                +
-                m_seekerYawAngle;
-
-
-            double finalScalePitch =
-                ControlConstants::SEEKER_PITCH_CENTER
-                +
-                m_seekerPitchAngle;
-
-
-            std::cout
-                << " [추적중]"
-                << " Error X: "
-                << seekerErrorX
-                << "도"
-                << " | Error Y: "
-                << seekerErrorY
-                << "도"
-                << " | Yaw: "
-                << finalScaleYaw
-                << "도"
-                << " | Pitch: "
-                << finalScalePitch
-                << "도\n";
-
-
-            // ------------------------------------------------
-            // Lock-On 판단
-            // ------------------------------------------------
-
-            if (
-                std::abs(seekerErrorX)
-                    <= ControlConstants::LOCKON_THRESHOLD
-                &&
-                std::abs(seekerErrorY)
-                    <= ControlConstants::LOCKON_THRESHOLD
-            )
-            {
-                ++m_stableLockCount;
-
-
-                /*
-                 * 5회 연속 오차 조건 만족 시
-                 * 안정적인 Lock-On으로 판단한다.
-                 */
-                if (m_stableLockCount >= 5)
-                {
-                    std::cout
-                        << "\n -> [LOCK-ON SUCCESS]\n";
-
-
-                    /*
-                     * Phase 4에서 동체 정렬에 사용할
-                     * 시커의 절대 방향을 저장한다.
-                     */
-                    m_seekerAbsYaw =
-                        finalScaleYaw;
-
-
-                    m_seekerAbsPitch =
-                        finalScalePitch;
-
-
-                    break;
-                }
-            }
-
-            else
-            {
-                /*
-                 * 오차 조건을 벗어나면
-                 * 안정화 카운터를 다시 초기화한다.
-                 */
-                m_stableLockCount = 0;
-            }
-
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(
-                    static_cast<long long>(
-                        ControlConstants::LOOP_TIME_MS
-                    )
-                )
-            );
-        }
-
-        if (checkExitRequest())
-        {
-            return;
-        }
-
-        m_currentState = SystemState::BODY_TRACKING;
-
-    }
-
-    // ========================================================
-    // Phase 4
-    // Body Tracking
-    // ========================================================
-    /*
-     * 시커가 바라보는 방향을 기준으로
-     * 동체를 정렬한다.
-     *
-     * 현재는 P 제어 기반 Mock 동체 모델을 유지한다.
-     */
-
-    void processPhase4_BodyTracking()
-    {
-        std::cout
-            << "\n[Phase 4] 동체-시커 정렬 시작\n";
-
-
-        /*
-         * 동체 P 제어 Gain
-         *
-         * 추후 실험을 통해 튜닝한다.
-         */
-        const double bodyKpX = 0.25;
-        const double bodyKpY = 0.20;
-
-
-        while(true)
-        {
-            /*
-             * 사용자 안전 종료 요청 확인
-             */
-            if (checkExitRequest())
-            {
-                break;
-            }
-
-            /*
-             * 시커 중심축과 동체 사이의 방향 오차
-             */
-            double bodyErrorX =
-                m_seekerAbsYaw
-                -
-                ControlConstants::SEEKER_YAW_CENTER;
-
-
-            double bodyErrorY =
-                m_seekerAbsPitch
-                -
-                ControlConstants::SEEKER_PITCH_CENTER;
-
-
-            /*
-             * 최종 정렬 완료 판정
-             */
-            if (
-                std::abs(bodyErrorX)
-                    <= ControlConstants::TRACKING_TOLERANCE
-                &&
-                std::abs(bodyErrorY)
-                    <= ControlConstants::TRACKING_TOLERANCE
-            )
-            {
-                std::cout
-                    << "\n -> [ALIGNMENT COMPLETE]\n";
-
-
-                break;
-            }
-
-
-            /*
-             * P 제어
-             *
-             * 이동량 = Error × Kp
-             */
-            double bodyMoveX =
-                bodyErrorX * bodyKpX;
-
-
-            double bodyMoveY =
-                bodyErrorY * bodyKpY;
-
-
-            /*
-             * 현재 Mock 동체 모델에 제어량 적용
-             */
-            m_currentBodyX += bodyMoveX;
-            m_currentBodyY += bodyMoveY;
-
-
-            /*
-             * 동체가 시커 방향으로 이동했다고 가정하여
-             * 시커-동체 상대 오차를 감소시킨다.
-             *
-             * 실제 하드웨어에서는 IMU 등의
-             * 실제 피드백값으로 대체한다.
-             */
-            m_seekerAbsYaw -= bodyMoveX;
-            m_seekerAbsPitch -= bodyMoveY;
-
-
-            std::cout
-                << " [정렬중]"
-                << " Error X: "
-                << bodyErrorX
-                << "도"
-                << " | Error Y: "
-                << bodyErrorY
-                << "도"
-                << " | Body X: "
-                << m_currentBodyX
-                << "도"
-                << " | Body Y: "
-                << m_currentBodyY
-                << "도\n";
-
-
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(
-                    static_cast<long long>(
-                        ControlConstants::LOOP_TIME_MS
-                    )
-                )
-            );
-        }
-
-        if (checkExitRequest())
-        {
-            return;
-        }
-
-        m_currentState =  SystemState::MISSION_COMPLETE;
+            << " -> 복귀 완료\n"
+            << "    Body Yaw Position   : "
+            << m_bodyYawStepper.getCurrentPosition()
+            << " step\n"
+            << "    Mass Shift Position : "
+            << m_massShiftStepper.getCurrentPosition()
+            << " step\n";
     }
 };
 
@@ -1254,17 +587,9 @@ private:
 
 int main()
 {
-    /*
-     * 종합 유도 제어기 생성
-     */
     IntegratedMissileController controller;
 
-
-    /*
-     * Phase 1 → Phase 4 상태 머신 실행
-     */
     controller.runSystem();
-
 
     return 0;
 }
