@@ -34,12 +34,12 @@
  */
 
 // Left Ultrasonic Sensor
-constexpr unsigned int LEFT_TRIG_PIN = 5;
-constexpr unsigned int LEFT_ECHO_PIN = 20;
+constexpr unsigned int LEFT_TRIG_PIN = 12;
+constexpr unsigned int LEFT_ECHO_PIN = 13;
 
 // Right Ultrasonic Sensor
-constexpr unsigned int RIGHT_TRIG_PIN = 12;
-constexpr unsigned int RIGHT_ECHO_PIN = 13;
+constexpr unsigned int RIGHT_TRIG_PIN = 5;
+constexpr unsigned int RIGHT_ECHO_PIN = 20;
 
 
 /*

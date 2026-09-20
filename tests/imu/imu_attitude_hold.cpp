@@ -4,51 +4,51 @@
  *
  * IMU Based Mass-Shift Attitude Hold
  *
- * 목적
+ * Description
  * ------------------------------------------------------------
- * MPU6050에서 측정한 자세가 초기 기준 자세에서 벗어나면
- * 질량이동 액추에이터를 자동으로 움직여 초기 자세를 유지한다.
+ * MPU6050에서 측정한 Pitch 자세가 목표 자세에서 벗어나면
+ * 질량이동 액추에이터를 이용하여 자세를 보정한다.
  *
- * 기준 IMU 값:
- *
- * ACCEL X = -243.46
- * ACCEL Y = +212.14
- * ACCEL Z = -15456.30
- *
- * GYRO X BIAS = +43.13
- * GYRO Y BIAS = -118.01
- * GYRO Z BIAS = -48.03
+ * 제어 방식:
+ * - Pitch Error 기반 P 제어
+ * - 오차가 클수록 한 번에 더 많은 Step 이동
+ * - Dead Zone 내부에서는 질량 위치 유지
  *
  * Actuator:
- * 현재 물리적 중심 = 0 step
- * 이동 범위 = -1300 ~ +1300 step
+ * - 프로그램 시작 위치 = 0 step
+ * - 소프트웨어 이동 범위 = -1300 ~ +1300 step
  *
  * 종료:
- * Q 또는 Ctrl+C
- * -> 액추에이터 0 step 복귀
- * -> A4988 Disable
- * -> 프로그램 종료
+ * - Q 또는 Ctrl+C
+ * - 현재 누적 위치의 반대 방향으로 이동
+ * - 프로그램 시작 위치인 0 step으로 복귀
+ *
+ * Project:
+ * Mass Shift Guidance Control System
  * ============================================================
  */
 
+
 #include "MPU6050.h"
 #include "StepperMotor.h"
+#include "calibration_data.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <iostream>
-#include <termios.h>
 #include <thread>
 #include <unistd.h>
+#include <sys/select.h>
 
 
 /*
  * ============================================================
  * A4988 GPIO
  * ============================================================
+ *
+ * BCM GPIO 번호
  */
 
 constexpr int STEP_PIN = 17;
@@ -58,8 +58,13 @@ constexpr int ENABLE_PIN = 22;
 
 /*
  * ============================================================
- * Actuator Limit
+ * Actuator Software Limit
  * ============================================================
+ *
+ * 프로그램 시작 시 현재 물리 위치를 0 step으로 정의한다.
+ *
+ * 현재 위치를 기준으로 ±1300 step 범위 안에서만
+ * 액추에이터가 움직일 수 있도록 제한한다.
  */
 
 constexpr long ACTUATOR_MIN_STEP = -1300;
@@ -67,88 +72,150 @@ constexpr long ACTUATOR_MAX_STEP = 1300;
 
 
 /*
- * 한 번의 제어 명령에서 이동할 Step
+ * ============================================================
+ * Stepper Motor Speed
+ * ============================================================
  *
- * 첫 시험은 너무 크게 움직이지 않도록
- * 10 step부터 시작한다.
+ * 기존 테스트:
+ * 1500 us
+ *
+ * Attitude Hold:
+ * 빠른 자세 보정을 위해 500 us부터 시험한다.
+ *
+ * 모터가 Step을 놓치거나 진동하면
+ * 600 ~ 800 us로 증가시킨다.
  */
 
-constexpr int CONTROL_STEP = 10;
-
-
-/*
- * STEP Pulse Delay
- */
-
-constexpr int PULSE_DELAY_US = 800;
+constexpr int PULSE_DELAY_US = 500;
 
 
 /*
  * ============================================================
- * IMU Calibration
+ * Target Attitude
  * ============================================================
+ *
+ * 2026-09-20 imu_reference_test에서 측정한
+ * 현재 기준 Pitch 자세.
  */
 
-/*
- * 정지 상태 가속도 평균값
- */
-
-constexpr double ACCEL_X_REF = -243.46;
-constexpr double ACCEL_Y_REF = 212.14;
-constexpr double ACCEL_Z_REF = -15456.30;
-
-
-/*
- * Gyroscope Bias
- */
-
-constexpr double GYRO_X_BIAS = 43.13;
-constexpr double GYRO_Y_BIAS = -118.01;
-constexpr double GYRO_Z_BIAS = -48.03;
-
-
-/*
- * MPU6050 ±250 deg/s 기준
- */
-
-constexpr double GYRO_SCALE = 131.0;
+constexpr double TARGET_PITCH_DEG = 0.1832;
 
 
 /*
  * ============================================================
- * Attitude Control Settings
+ * P Controller
  * ============================================================
+ *
+ * moveStep = |Pitch Error| * KP_STEP
+ *
+ * 예:
+ *
+ * Error 0.5 deg -> 약 7 step
+ * Error 1.0 deg -> 15 step
+ * Error 2.0 deg -> 30 step
+ * Error 3.0 deg -> 45 step
+ * Error 4.0 deg -> 60 step
+ *
+ * 단, MIN / MAX 범위로 제한한다.
  */
 
+constexpr double KP_STEP = 22.0;
+
+
 /*
- * 현재 질량이동 축이 Pitch를 제어한다고 가정한다.
- *
- * 초기 시험에서는 가속도계 기반 Pitch를 사용한다.
- *
- * ±1도 이내에서는 액추에이터를 움직이지 않는다.
- * IMU 노이즈로 인한 지속적인 왕복운동을 막기 위한 값이다.
+ * 최소 제어 Step
  */
 
-constexpr double ANGLE_DEADZONE_DEG = 1.0;
+constexpr int MIN_CONTROL_STEP = 5;
 
 
 /*
- * 액추에이터 이동 방향
+ * 최대 제어 Step
  *
- * 실제 시험에서 자세 오차가 더 커진다면
- * 1을 -1로 변경하면 된다.
+ * 한 번에 지나치게 많은 Step을 이동하면
+ * IMU 측정이 중단되는 시간이 길어질 수 있으므로
+ * 우선 60 step으로 제한한다.
+ */
+
+constexpr int MAX_CONTROL_STEP = 90;
+
+
+/*
+ * ============================================================
+ * Dead Zone
+ * ============================================================
+ *
+ * ±0.5도 이내에서는 질량을 이동시키지 않는다.
+ *
+ * IMU 노이즈에 의한 지속적인 왕복 이동 방지.
+ */
+
+constexpr double ANGLE_DEADZONE_DEG = 0.5;
+
+
+/*
+ * ============================================================
+ * Actuator Direction
+ * ============================================================
+ *
+ * 자세 오차가 +일 때 이동해야 하는 방향.
+ *
+ * 실제 테스트에서 오차가 더 커지는 방향으로
+ * 질량이 이동한다면 1 -> -1로 변경한다.
  */
 
 constexpr int ACTUATOR_DIRECTION = 1;
 
 
 /*
- * 제어 주기
+ * ============================================================
+ * Static Trim
+ * ============================================================
  *
- * 50ms = 20Hz
+ * 시커부 무게 때문에 동체 앞쪽이 무거운 경우
+ * 내부 질량을 시작부터 일정 Step 이동시켜
+ * 정적 무게 불균형을 일부 보상할 수 있다.
+ *
+ * 현재는 기능 확인을 위해 0으로 둔다.
+ *
+ * 방향 확인 후:
+ *
+ * +100, +200 ...
+ *
+ * 또는
+ *
+ * -100, -200 ...
+ *
+ * 순서로 시험한다.
  */
 
-constexpr int CONTROL_PERIOD_MS = 50;
+constexpr int STATIC_TRIM_STEP = 0;
+
+
+/*
+ * ============================================================
+ * Control Period
+ * ============================================================
+ *
+ * 기존 50 ms -> 20 ms
+ *
+ * 약 50 Hz 주기로 자세 상태를 확인한다.
+ *
+ * 단 실제 주기는 moveSteps() 실행 시간만큼 추가된다.
+ */
+
+constexpr int CONTROL_PERIOD_MS = 20;
+
+
+/*
+ * ============================================================
+ * MPU6050 Gyro Scale
+ * ============================================================
+ *
+ * ±250 deg/s
+ */
+
+constexpr double GYRO_SCALE = 131.0;
 
 
 /*
@@ -171,8 +238,7 @@ void signalHandler(int signal)
     if (signal == SIGINT)
     {
         /*
-         * Signal Handler에서는
-         * 모터를 직접 움직이지 않는다.
+         * Signal Handler 내부에서 모터를 직접 움직이지 않는다.
          *
          * 메인 루프에 종료 요청만 전달한다.
          */
@@ -184,10 +250,10 @@ void signalHandler(int signal)
 
 /*
  * ============================================================
- * Keyboard Check
+ * Keyboard Input Check
  * ============================================================
  *
- * Q 입력을 확인하기 위한 비동기 키 입력 함수.
+ * Q 입력을 Non-blocking 방식으로 확인한다.
  */
 
 bool keyPressed()
@@ -216,8 +282,11 @@ bool keyPressed()
  * Safe Move
  * ============================================================
  *
- * 액추에이터 위치가
- * -1300 ~ +1300 범위를 벗어나지 않도록 한다.
+ * 액추에이터가 소프트웨어 제한
+ *
+ * -1300 ~ +1300 step
+ *
+ * 범위를 벗어나지 않도록 제한한다.
  */
 
 bool safeMove(
@@ -227,18 +296,16 @@ bool safeMove(
     long currentPosition =
         motor.getCurrentPosition();
 
-
     long targetPosition =
         currentPosition +
         requestedSteps;
 
 
     /*
-     * +1300 제한
+     * + 방향 제한
      */
 
-    if (targetPosition >
-        ACTUATOR_MAX_STEP)
+    if (targetPosition > ACTUATOR_MAX_STEP)
     {
         requestedSteps =
             static_cast<int>(
@@ -248,11 +315,10 @@ bool safeMove(
 
 
     /*
-     * -1300 제한
+     * - 방향 제한
      */
 
-    else if (targetPosition <
-             ACTUATOR_MIN_STEP)
+    else if (targetPosition < ACTUATOR_MIN_STEP)
     {
         requestedSteps =
             static_cast<int>(
@@ -262,7 +328,7 @@ bool safeMove(
 
 
     /*
-     * 이미 한계 위치
+     * 이미 한계 위치인 경우
      */
 
     if (requestedSteps == 0)
@@ -278,14 +344,14 @@ bool safeMove(
 
 /*
  * ============================================================
- * Return To Center
+ * Return To Start Position
  * ============================================================
  *
- * 프로그램 종료 시
- * 액추에이터를 시작 위치인 0 step으로 복귀시킨다.
+ * 현재 논리 위치의 반대 Step만큼 이동하여
+ * 프로그램 시작 위치인 0 step으로 복귀한다.
  */
 
-bool returnToCenter(
+bool returnToStart(
     StepperMotor& motor)
 {
     long currentPosition =
@@ -316,8 +382,7 @@ bool returnToCenter(
 
 
     /*
-     * 현재 위치의 반대만큼 이동하면
-     * 시작 위치인 0 step으로 돌아간다.
+     * 현재 위치의 반대 방향으로 복귀
      */
 
     long returnSteps =
@@ -356,10 +421,10 @@ bool returnToCenter(
  * Pitch Calculation
  * ============================================================
  *
- * 가속도 센서의 중력벡터를 이용해
- * Pitch 각도를 계산한다.
+ * 가속도계의 중력 벡터를 이용하여
+ * 현재 Pitch 각도를 계산한다.
  *
- * 단위: degree
+ * 단위 : degree
  */
 
 double calculatePitch(
@@ -368,7 +433,8 @@ double calculatePitch(
     double az)
 {
     constexpr double RAD_TO_DEG =
-        180.0 / 3.14159265358979323846;
+        180.0 /
+        3.14159265358979323846;
 
 
     return std::atan2(
@@ -382,6 +448,73 @@ double calculatePitch(
 
 /*
  * ============================================================
+ * P Controller
+ * ============================================================
+ *
+ * Pitch Error를 입력받아
+ * 실제 액추에이터 이동 Step을 계산한다.
+ */
+
+int calculateControlStep(
+    double pitchError)
+{
+    /*
+     * Dead Zone
+     */
+
+    if (std::abs(pitchError)
+        <= ANGLE_DEADZONE_DEG)
+    {
+        return 0;
+    }
+
+
+    /*
+     * P Control
+     */
+
+    int controlStep =
+        static_cast<int>(
+            std::abs(pitchError) *
+            KP_STEP);
+
+
+    /*
+     * 최소 / 최대 이동량 제한
+     */
+
+    controlStep =
+        std::clamp(
+            controlStep,
+            MIN_CONTROL_STEP,
+            MAX_CONTROL_STEP);
+
+
+    /*
+     * Pitch Error 방향 결정
+     */
+
+    if (pitchError < 0.0)
+    {
+        controlStep =
+            -controlStep;
+    }
+
+
+    /*
+     * 실제 액추에이터 설치 방향 적용
+     */
+
+    controlStep *=
+        ACTUATOR_DIRECTION;
+
+
+    return controlStep;
+}
+
+
+/*
+ * ============================================================
  * Main
  * ============================================================
  */
@@ -390,7 +523,7 @@ int main()
 {
     std::cout
         << "========================================\n"
-        << " IMU Mass-Shift Attitude Hold\n"
+        << " IMU Mass-Shift P Attitude Hold\n"
         << "========================================\n";
 
 
@@ -405,7 +538,7 @@ int main()
 
     /*
      * ========================================================
-     * MPU6050
+     * MPU6050 Initialization
      * ========================================================
      */
 
@@ -427,7 +560,7 @@ int main()
 
     /*
      * ========================================================
-     * Actuator
+     * Actuator Initialization
      * ========================================================
      */
 
@@ -436,6 +569,19 @@ int main()
         DIR_PIN,
         ENABLE_PIN);
 
+
+    /*
+     * motor_center_calibration.cpp와 동일한 방식으로
+     * Pulse Delay를 설정한다.
+     */
+
+    actuator.setPulseDelay(
+        PULSE_DELAY_US);
+
+
+    /*
+     * GPIO 초기화
+     */
 
     if (!actuator.initialize())
     {
@@ -446,35 +592,19 @@ int main()
     }
 
 
+    /*
+     * A4988 활성화
+     */
+
     actuator.enable();
 
 
-    actuator.setPulseDelay(
-        PULSE_DELAY_US);
-
-
     /*
-     * 현재 물리적 중심을
-     * 프로그램상 0 step으로 정의
+     * 프로그램 시작 시 현재 물리 위치를
+     * 논리적인 0 step으로 정의한다.
      */
 
     actuator.setCurrentPosition(0);
-
-
-    /*
-     * ========================================================
-     * Reference Attitude
-     * ========================================================
-     *
-     * 사용자가 측정한 초기 가속도 평균값으로
-     * 목표 Pitch를 계산한다.
-     */
-
-    const double TARGET_PITCH_DEG =
-        calculatePitch(
-            ACCEL_X_REF,
-            ACCEL_Y_REF,
-            ACCEL_Z_REF);
 
 
     std::cout
@@ -494,9 +624,49 @@ int main()
         << ANGLE_DEADZONE_DEG
         << " deg\n"
 
-        << "[INIT] Control Step = "
-        << CONTROL_STEP
-        << " step\n";
+        << "[INIT] KP = "
+        << KP_STEP
+        << " step/deg\n"
+
+        << "[INIT] Max Control = "
+        << MAX_CONTROL_STEP
+        << " step\n"
+
+        << "[INIT] Pulse Delay = "
+        << PULSE_DELAY_US
+        << " us\n"
+
+        << "[INIT] Control Period = "
+        << CONTROL_PERIOD_MS
+        << " ms\n";
+
+
+    /*
+     * ========================================================
+     * Static Trim
+     * ========================================================
+     */
+
+    if (STATIC_TRIM_STEP != 0)
+    {
+        std::cout
+            << "[TRIM] Static Trim = "
+            << STATIC_TRIM_STEP
+            << " step\n";
+
+
+        if (!safeMove(
+                actuator,
+                STATIC_TRIM_STEP))
+        {
+            std::cerr
+                << "[ERROR] Static Trim Failed\n";
+
+            actuator.disable();
+
+            return 1;
+        }
+    }
 
 
     std::cout
@@ -514,13 +684,14 @@ int main()
     {
         /*
          * ====================================================
-         * Q 입력 확인
+         * Keyboard Check
          * ====================================================
          */
 
         if (keyPressed())
         {
             char key = 0;
+
 
             if (read(
                     STDIN_FILENO,
@@ -576,7 +747,7 @@ int main()
 
         /*
          * ====================================================
-         * 현재 Pitch 계산
+         * Current Pitch
          * ====================================================
          */
 
@@ -588,7 +759,7 @@ int main()
 
 
         /*
-         * 목표 자세와 현재 자세의 차이
+         * 목표 자세 - 현재 자세
          */
 
         double pitchError =
@@ -598,11 +769,12 @@ int main()
 
         /*
          * ====================================================
-         * Gyro Bias Correction
+         * Gyroscope Bias Correction
          * ====================================================
          *
-         * 현재 버전에서는 제어에 직접 사용하지 않지만
-         * 다음 complementary filter 적용을 위해 계산한다.
+         * 아직 P 제어에는 직접 사용하지 않는다.
+         *
+         * 추후 PD / Complementary Filter 적용 시 사용.
          */
 
         double correctedGY =
@@ -617,48 +789,13 @@ int main()
 
         /*
          * ====================================================
-         * Attitude Control
+         * P Control
          * ====================================================
          */
 
-        int moveCommand = 0;
-
-
-        /*
-         * 목표보다 Pitch가 한쪽으로 벗어난 경우
-         */
-
-        if (pitchError >
-            ANGLE_DEADZONE_DEG)
-        {
-            moveCommand =
-                CONTROL_STEP *
-                ACTUATOR_DIRECTION;
-        }
-
-
-        /*
-         * 반대쪽으로 벗어난 경우
-         */
-
-        else if (pitchError <
-                 -ANGLE_DEADZONE_DEG)
-        {
-            moveCommand =
-                -CONTROL_STEP *
-                ACTUATOR_DIRECTION;
-        }
-
-
-        /*
-         * Dead Zone 내부라면
-         * 현재 질량 위치 유지
-         */
-
-        else
-        {
-            moveCommand = 0;
-        }
+        int moveCommand =
+            calculateControlStep(
+                pitchError);
 
 
         /*
@@ -685,7 +822,7 @@ int main()
 
         /*
          * ====================================================
-         * Debug
+         * Debug Output
          * ====================================================
          */
 
@@ -702,7 +839,7 @@ int main()
             << " GyroY:"
             << gyroYDegPerSec
 
-            << " | Step:"
+            << " | Cmd:"
             << moveCommand
 
             << " Pos:"
@@ -727,13 +864,9 @@ int main()
      * ========================================================
      * Safe Shutdown
      * ========================================================
-     *
-     * Q 또는 Ctrl+C가 들어오면
-     * 현재 질량 위치와 관계없이
-     * 프로그램 시작 위치인 0으로 복귀한다.
      */
 
-    returnToCenter(
+    returnToStart(
         actuator);
 
 
