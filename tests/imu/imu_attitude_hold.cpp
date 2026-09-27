@@ -119,7 +119,7 @@ constexpr double TARGET_PITCH_DEG = 0.1832;
  * 단, MIN / MAX 범위로 제한한다.
  */
 
-constexpr double KP_STEP = 22.0;
+constexpr double KP_STEP = 15.0;
 
 
 /*
@@ -137,7 +137,7 @@ constexpr int MIN_CONTROL_STEP = 5;
  * 우선 60 step으로 제한한다.
  */
 
-constexpr int MAX_CONTROL_STEP = 90;
+constexpr int MAX_CONTROL_STEP = 60;
 
 
 /*
